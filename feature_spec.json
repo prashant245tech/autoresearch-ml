@@ -1,0 +1,151 @@
+{
+  "version": "1.0",
+  "data_file": "/Users/prashant/Downloads/Tier_TreeHouse_Winland 1 - Copy.xlsx",
+  "target_column": "Tier 1 Price/MSF",
+  "test_size": 0.2,
+  "random_state": 42,
+  "outlier_iqr_k": 4.0,
+  "features": [
+    {
+      "column": "Size Bucket",
+      "type": "ordinal",
+      "required": false,
+      "drop_if_null": false,
+      "fill_null": {"strategy": "value", "value": "UNKNOWN"},
+      "clip": {"min": null, "max": null},
+      "normalise": "uppercase_strip",
+      "ordinal_order": ["0-3.0", "3.1-5.5", "5.6-8.5", "8.6-15.0", "15.1-30.0", "30.1-90.0"],
+      "unknown_sentinel": -1,
+      "notes": "Bucketed size proxy ordered from smallest to largest carton size"
+    },
+    {
+      "column": "SQ. FT. PER PC",
+      "type": "numeric",
+      "required": false,
+      "drop_if_null": false,
+      "fill_null": {"strategy": "median"},
+      "clip": {"min": 0.01, "max": null},
+      "normalise": "none",
+      "notes": "Primary cost driver — surface area of corrugated blank"
+    },
+    {
+      "column": "Quantity",
+      "type": "numeric",
+      "required": false,
+      "drop_if_null": false,
+      "fill_null": {"strategy": "value", "value": 0},
+      "clip": {"min": 0, "max": null},
+      "normalise": "none",
+      "notes": "Zero-quantity rows are catalog prices; keep but flag"
+    },
+    {
+      "column": "Flute 1",
+      "type": "ordinal",
+      "required": false,
+      "drop_if_null": false,
+      "fill_null": {"strategy": "value", "value": "UNKNOWN"},
+      "clip": {"min": null, "max": null},
+      "normalise": "uppercase_strip",
+      "ordinal_order": ["F", "E", "N", "B", "C", "BC"],
+      "unknown_sentinel": -1,
+      "notes": "Ordered by board thickness/cost; BC is most expensive double-wall"
+    },
+    {
+      "column": "Stock",
+      "type": "categorical",
+      "required": false,
+      "drop_if_null": false,
+      "fill_null": {"strategy": "value", "value": "UNKNOWN"},
+      "clip": {"min": null, "max": null},
+      "normalise": "uppercase_strip",
+      "categorical_consolidation": {
+        "WHITE": "WHITE",
+        "KRAFT": "KRAFT",
+        "KRAFT MEDIUMS": "KRAFT",
+        "WHITE BOTH SIDES": "WHITE",
+        "PREPRINT": "OTHER",
+        "NON CORRUGATED": "OTHER"
+      },
+      "unknown_sentinel": "UNKNOWN",
+      "notes": "WHITE liner costs more than KRAFT; consolidate messy variants"
+    },
+    {
+      "column": "Box Style",
+      "type": "categorical",
+      "required": false,
+      "drop_if_null": false,
+      "fill_null": {"strategy": "value", "value": "UNKNOWN"},
+      "clip": {"min": null, "max": null},
+      "normalise": "uppercase_strip",
+      "categorical_consolidation": {
+        "D/C JOINED": "DCJ",
+        "D/C NON JOINED": "DCJ",
+        "DC-NJ": "DCJ",
+        "DIE CUT JOINED": "DCJ",
+        "DIE CUT NON JOINED": "DCJ",
+        "DIE CUT": "DCT",
+        "D/C": "DCJ",
+        "D/C RSC": "RSC",
+        "D/C HSC": "HSC",
+        "DCT": "DCT",
+        "BULK": "OTHER"
+      },
+      "unknown_sentinel": "UNKNOWN",
+      "notes": "Die-cut styles have higher setup cost than RSC"
+    },
+    {
+      "column": "Region",
+      "type": "categorical",
+      "required": false,
+      "drop_if_null": false,
+      "fill_null": {"strategy": "value", "value": "UNKNOWN"},
+      "clip": {"min": null, "max": null},
+      "normalise": "uppercase_strip",
+      "unknown_sentinel": "UNKNOWN",
+      "notes": "Geographic variation in freight and supplier pricing"
+    },
+    {
+      "column": "Ink Coverage Bucket",
+      "type": "ordinal",
+      "required": false,
+      "drop_if_null": false,
+      "fill_null": {"strategy": "value", "value": "UNKNOWN"},
+      "clip": {"min": null, "max": null},
+      "normalise": "uppercase_strip",
+      "ordinal_order": ["0-10%", "10-20%", "20-30%", "30-40%", "40-50%", ">50%"],
+      "unknown_sentinel": -1,
+      "notes": "Bucketed print coverage ordered from least to most ink"
+    },
+    {
+      "column": "Tare Weight",
+      "type": "numeric",
+      "required": false,
+      "drop_if_null": false,
+      "fill_null": {"strategy": "median"},
+      "clip": {"min": 0.001, "max": null},
+      "normalise": "none",
+      "notes": "Box weight correlates with board caliper/thickness"
+    },
+    {
+      "column": "Adhesive",
+      "type": "categorical",
+      "required": false,
+      "drop_if_null": false,
+      "fill_null": {"strategy": "value", "value": "UNKNOWN"},
+      "clip": {"min": null, "max": null},
+      "normalise": "uppercase_strip",
+      "unknown_sentinel": "UNKNOWN",
+      "notes": "Adhesive type affects manufacturing cost slightly"
+    },
+    {
+      "column": "Litho Box",
+      "type": "boolean",
+      "required": false,
+      "drop_if_null": false,
+      "fill_null": {"strategy": "value", "value": 0},
+      "clip": {"min": 0, "max": 1},
+      "normalise": "none",
+      "notes": "Lithographic boxes command a premium price"
+    }
+  ]
+}

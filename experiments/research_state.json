@@ -1,0 +1,12 @@
+{
+  "created_at": "2026-03-21T13:16:21",
+  "budget_s": 300,
+  "frozen_inputs": {
+    "compile.py": "360953e21e58a4744219394a5c4f470aff709000c9ce14de7b4eeba054ad0247",
+    "feature_spec.json": "d332219ba920242adce312e908177f402aa80a4fe34792e4613c23d451bcacdb",
+    "prepare.py": "1624e3747918fa1efb26e4d951243d2fcac93d405c1c0c835b625cf1940d390d",
+    "data/train.parquet": "3c43dfa46f70f92262d1bd320689592a61174cdfe7d8745ac66e3922556f9c61",
+    "data/test.parquet": "f1e1a219c6d53564f3c6529399fbca426486c6140fdf7c9c84c83800de1e5ea2",
+    "data/columns.json": "fe617a9e95b59a520c34a7aae3c34fe5559add56443c494ea6c15b5aa1112720"
+  }
+}
