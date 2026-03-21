@@ -2,5 +2,14 @@
 __pycache__/
 .DS_Store
 .env
+config/feature_spec.json
+config/task_context.md
+data/
+experiments/results.json
+experiments/results.csv
+experiments/research_state.json
+models/best_model.pkl
+models/best_features.pkl
+models/best_train.py
 models/accepted/
 experiments/session_baseline.json

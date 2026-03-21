@@ -8,12 +8,14 @@ LLM control, best-model state, or git keep/discard behavior.
 
 ```text
 corrugated_automl/
-|- program.md        external-agent tuning policy plus task-specific context
+|- program.md        external-agent tuning policy
 |- train.py          the only experiment file the agent edits
 |- run_experiment.py deterministic runner with `run` and `accept`
 |- prepare.py        fixed data preparation -> data/train.parquet + data/test.parquet
-|- feature_spec.json agent-written prep spec consumed by prepare.py
-|- feature_spec.schema.json JSON schema for the prep spec
+|- config/
+|  |- feature_spec.json agent-written prep spec consumed by prepare.py
+|  |- task_context.md local task-specific notes (optional, untracked)
+|  `- feature_spec.schema.json JSON schema for the prep spec
 |- data/
 |  |- train.parquet
 |  |- test.parquet
@@ -44,21 +46,24 @@ corrugated_automl/
 If you already have `data/train.parquet`, `data/test.parquet`, and `data/columns.json`,
 you can skip this section.
 
-1. Customize the task-specific template in `program.md`.
-2. Create or update `feature_spec.json` from those `config` and `features` sections.
+1. Update `config/task_context.md` if the current task needs local dataset-specific notes.
+2. Create or update `config/feature_spec.json` from the local task context and user instructions.
    - Use `train_row_filters` to restrict the training cohort.
    - Use `filter_specs` when filters depend on cleanup rules for columns that are not model features.
    - Use `test_data_file` and optional `test_target_column` for an explicit holdout dataset.
    - Use `test_row_filters` to scope the explicit holdout dataset when needed.
-   - Follow [feature_spec.schema.json](/Users/prashant/Downloads/corrugated_automl%202/feature_spec.schema.json).
+   - Follow [feature_spec.schema.json](/Users/prashant/Downloads/corrugated_automl 2/config/feature_spec.schema.json).
 3. Run:
 
 ```bash
 python prepare.py
 ```
 
-The setup contract is: `program.md` expresses intent, `feature_spec.json` makes
-that intent explicit, and `prepare.py` consumes the explicit spec deterministically.
+The setup contract is:
+- `program.md` defines the generic agent workflow
+- `config/task_context.md` holds local task-specific notes when needed
+- `config/feature_spec.json` is the executable prep spec
+- `prepare.py` consumes that explicit spec deterministically
 
 The first `run` or `accept` in a tuning session creates
 `experiments/session_baseline.json`, which records the hashes of the prepared

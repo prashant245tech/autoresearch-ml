@@ -9,19 +9,19 @@ It is not consumed by `run_experiment.py`.
 
 If the prepared parquet files do not exist yet, or if the dataset definition has changed:
 
-1. Update the task-specific `config` and `features` sections in this file.
-2. Create or update `feature_spec.json` directly from those sections.
-   - Keep `feature_spec.json` explicit and machine-readable because `prepare.py`
+1. Update `config/task_context.md` if you need local dataset-specific notes for the current task.
+2. Create or update `config/feature_spec.json` directly from the local task context and user instructions.
+   - Keep `config/feature_spec.json` explicit and machine-readable because `prepare.py`
      executes it deterministically.
-   - Follow `feature_spec.schema.json` when writing the spec.
+   - Follow `config/feature_spec.schema.json` when writing the spec.
    - If the user wants to train on a subset of rows, encode that as
-     `train_row_filters` in `feature_spec.json`.
+     `train_row_filters` in `config/feature_spec.json`.
    - If a filtered column should be cleaned or normalized but should not become
      a model feature, declare it in `filter_specs`.
    - If the user wants a separate evaluation dataset, set `test_data_file`
-     and optional `test_target_column` in `feature_spec.json`.
+     and optional `test_target_column` in `config/feature_spec.json`.
    - If the user wants to scope the explicit test dataset too, encode that as
-     `test_row_filters` in `feature_spec.json`.
+     `test_row_filters` in `config/feature_spec.json`.
 3. Run `python prepare.py`.
 4. Delete `experiments/session_baseline.json` if it exists from a prior session.
 5. Freeze the prepared data for the tuning session. The first
@@ -161,73 +161,18 @@ EXPERIMENT_DESCRIPTION = (
 
 ## Task-Specific Context
 
-This section is specific to the current corrugated pricing dataset. It is useful
-for the external agent when writing `feature_spec.json` during setup.
+Keep this file generic. Store real dataset paths, cohort notes, domain hints,
+and task-specific feature descriptions in the local untracked file
+`config/task_context.md`.
 
-## Dataset Config
-
-```config
-data_file: /Users/prashant/Downloads/Tier_TreeHouse_Winland 1 - Copy.xlsx
-target_column: Tier 1 Price/MSF
-test_size: 0.20
-random_state: 42
-outlier_iqr_k: 4.0
-```
+Use `config/task_context.md` for:
+- dataset paths and target column names
+- active cohort filters or business-scope constraints
+- task-specific feature descriptions
+- domain notes the agent should consider during setup
 
 If you want a separate holdout dataset, add `test_data_file` and optional
-`test_target_column` to `feature_spec.json` directly.
-
-## Active Cohort Setup
-
-- Current requested cohort: `Client = TreeHouse`
-- Current requested price scope: `Price Category = MODEL`
-- Train/test behavior: split train and test from this same filtered cohort
-- Exclude: `LEGACY`, `OFF MODEL`, and `NEEDS REVIEW`
-
-## Optional Prep Controls
-
-Use these when the task requires cohort-specific training or an explicit test set.
-The external agent should translate them into `feature_spec.json`.
-
-Example:
-
-```json
-{
-  "filter_specs": [
-    {
-      "column": "Price Category",
-      "type": "categorical",
-      "normalise": "uppercase_strip",
-      "fill_null": {"strategy": "value", "value": "UNKNOWN"},
-      "categorical_consolidation": {
-        "LEGACY PRICE": "LEGACY",
-        "LEGACY": "LEGACY"
-      },
-      "unknown_sentinel": "UNKNOWN"
-    },
-    {
-      "column": "Account Type",
-      "type": "categorical",
-      "normalise": "uppercase_strip",
-      "fill_null": {"strategy": "value", "value": "UNKNOWN"},
-      "categorical_consolidation": {
-        "FREE HOUSE ": "FREE HOUSE",
-        "FREEHOUSE": "FREE HOUSE"
-      },
-      "unknown_sentinel": "UNKNOWN"
-    }
-  ],
-  "train_row_filters": [
-    {"column": "Price Category", "op": "in", "value": ["LEGACY"]},
-    {"column": "Account Type", "op": "eq", "value": "FREE HOUSE"}
-  ],
-  "test_data_file": "/absolute/path/to/test_dataset.xlsx",
-  "test_target_column": "Tier 1 Price/MSF",
-  "test_row_filters": [
-    {"column": "Account Type", "op": "eq", "value": "FREE HOUSE"}
-  ]
-}
-```
+`test_target_column` to `config/feature_spec.json` directly.
 
 Supported filter ops:
 - `eq`, `ne`
@@ -235,113 +180,3 @@ Supported filter ops:
 - `gt`, `gte`, `lt`, `lte`
 - `contains`
 - `is_null`, `not_null`
-
-## Feature Spec
-
-```features
-
-Size Bucket:
-  Pre-bucketed size band for the box based on dimensional scale.
-  Ordered from smallest to largest: 0-3.0, 3.1-5.5, 5.6-8.5, 8.6-15.0, 15.1-30.0, 30.1-90.0.
-  Treat unexpected or null values as unknown sentinel -1.
-
-SQ. FT. PER PC:
-  Surface area of the corrugated blank in square feet per piece.
-  The single most important pricing driver - more area means more board consumed.
-  Fill missing with column median. Clip to minimum 0.01.
-
-Quantity:
-  Order quantity in pieces. Many rows have zero - these are catalog or model prices,
-  not actual orders. Keep zero rows but the distinction matters for the model.
-  Fill missing with 0. Clip negative values to 0.
-
-Flute 1:
-  Flute type - an ordered ranking by board thickness and cost.
-  Order from thinnest/cheapest to thickest/most expensive: F, E, N, B, C, BC.
-  BC is double-wall and costs roughly 40-60% more per MSF than B-flute.
-  Normalise inconsistent casing and spaces. Unknown values get a sentinel of -1.
-
-Stock:
-  Liner type. Either KRAFT (natural brown, cheaper) or WHITE (bleached, more expensive).
-  Normalise messy casing variants (wHITE, white -> WHITE). Anything not clearly
-  KRAFT or WHITE should be treated as OTHER. Fill missing with UNKNOWN.
-
-Box Style:
-  Structural style of the box. Main families: RSC, DCT, DCJ, TRAY, HSC, SHT, PAD.
-  Consolidate messy variants: D/C JOINED -> DCJ, D/C NON JOINED -> DCJ,
-  Die Cut -> DCT, D/C RSC -> RSC, D/C HSC -> HSC. Unknown -> OTHER.
-  Fill missing with UNKNOWN.
-
-Region:
-  Geographic sales region - Midwest, Northeast, Southeast, Southwest, West, Canada.
-  Affects price due to freight costs and regional supplier pricing differences.
-  Normalise case. Fill missing with UNKNOWN.
-
-Ink Coverage Bucket:
-  Pre-bucketed print coverage level ordered from least to most ink:
-  0-10%, 10-20%, 20-30%, 30-40%, 40-50%, >50%.
-  Treat Null or unexpected values as unknown sentinel -1.
-
-Tare Weight:
-  Weight of the empty box in pounds. Correlates with board weight and caliper.
-  Fill missing with column median. Clip to minimum 0.001.
-
-Adhesive:
-  Adhesive type used in box manufacture. MRA is standard, REGULAR is basic,
-  WPA is a specialty type. Normalise casing. Fill missing with UNKNOWN.
-
-Litho Box:
-  Binary flag - 1 if this is a lithographic (premium printed) box, 0 otherwise.
-  Litho boxes command a significant price premium. Fill missing with 0.
-
-```
-
-## Optional Task Notes
-
-Use this section for domain-specific guidance the external agent should consider.
-
-### What we are predicting
-- **Tier 1 Price/MSF** is price per thousand square feet of corrugated board
-  for the primary tiered quote level.
-
-### Dataset summary
-- Source: TreeHouse Foods / Winland supplier pricing data
-- About 2,950 usable rows after cleaning
-- Mix of RSC, DCT, DCJ, TRAY, HSC box styles
-- Predominantly B-flute and C-flute with a small BC double-wall segment
-
-### Likely drivers
-1. Board area (`SQ. FT. PER PC`)
-2. Quantity and price-break behavior
-3. Size bucket
-4. Flute type
-5. Printing (`Ink Coverage Bucket`, `Litho Box`)
-6. Stock
-7. Box style
-8. Region
-
-### Constraints
-- Do not use the target column as a feature.
-- Zero-quantity rows are valid but should be treated differently from real orders.
-- Keep experiments within the fixed 300-second `run` budget.
-- Favor feature engineering that reflects pricing logic such as area, quantity breaks,
-  setup amortization, and print complexity.
-
-### Derived features worth trying
-
-```python
-log_sqft = np.log1p(df["SQ. FT. PER PC"])
-qty_log = np.log1p(df["Quantity"])
-has_quantity = (df["Quantity"] > 0).astype(int)
-area_x_qty = df["SQ. FT. PER PC"] * qty_log
-area_x_flute = df["SQ. FT. PER PC"] * df["Flute 1_encoded"]
-area_x_size = df["SQ. FT. PER PC"] * df["Size Bucket_encoded"]
-area_x_ink = df["SQ. FT. PER PC"] * df["Ink Coverage Bucket_encoded"]
-weight_per_sqft = df["Tare Weight"] / (df["SQ. FT. PER PC"] + 1e-6)
-setup_proxy = 1.0 / (df["SQ. FT. PER PC"] * qty_log + 1.0)
-qty_tier = pd.cut(
-    df["Quantity"],
-    bins=[-1, 0, 500, 1000, 2500, 5000, 10000, np.inf],
-    labels=False,
-)
-```

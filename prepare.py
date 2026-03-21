@@ -1,10 +1,10 @@
 """
 prepare.py — Generic data preparation pipeline.
-Reads feature_spec.json and executes it deterministically. No LLM calls here.
-See feature_spec.schema.json for the prep-spec contract.
+Reads config/feature_spec.json and executes it deterministically. No LLM calls here.
+See config/feature_spec.schema.json for the prep-spec contract.
 
 Run order:
-    agent writes feature_spec.json                                      (once)
+    agent writes config/feature_spec.json                               (once)
     python prepare.py    ← executes spec → train/test parquet          (once per data change)
     python train.py      ← agent iterates on this
 """
@@ -20,8 +20,8 @@ from sklearn.model_selection import train_test_split
 
 warnings.filterwarnings("ignore")
 
-SPEC_PATH = "feature_spec.json"
-SPEC_SCHEMA_PATH = "feature_spec.schema.json"
+SPEC_PATH = "config/feature_spec.json"
+SPEC_SCHEMA_PATH = "config/feature_spec.schema.json"
 TRAIN_PATH = "data/train.parquet"
 TEST_PATH = "data/test.parquet"
 META_PATH = "data/columns.json"
@@ -152,7 +152,7 @@ def validate_column_specs(specs, label: str, require_non_empty: bool = False) ->
     if not isinstance(specs, list):
         _fail(f"{label} must be a list.")
     if require_non_empty and not specs:
-        _fail(f"feature_spec.json `{label}` must be a non-empty list.")
+        _fail(f"{SPEC_PATH} `{label}` must be a non-empty list.")
 
     validated = []
     seen_columns = set()
@@ -206,31 +206,31 @@ def validate_row_filters(filters, label: str) -> list:
 
 def validate_spec(spec: dict) -> dict:
     if not isinstance(spec, dict):
-        _fail("feature_spec.json must contain a top-level JSON object.")
-    _reject_unknown_keys(spec, ALLOWED_TOP_LEVEL_KEYS, "feature_spec.json")
+        _fail(f"{SPEC_PATH} must contain a top-level JSON object.")
+    _reject_unknown_keys(spec, ALLOWED_TOP_LEVEL_KEYS, SPEC_PATH)
 
     required_top_level = ["data_file", "target_column", "features"]
     missing = [key for key in required_top_level if key not in spec]
     if missing:
-        _fail("feature_spec.json is missing required keys: " + ", ".join(missing))
+        _fail(f"{SPEC_PATH} is missing required keys: " + ", ".join(missing))
 
     if not isinstance(spec["data_file"], str) or not spec["data_file"].strip():
-        _fail("feature_spec.json `data_file` must be a non-empty string.")
+        _fail(f"{SPEC_PATH} `data_file` must be a non-empty string.")
     if not isinstance(spec["target_column"], str) or not spec["target_column"].strip():
-        _fail("feature_spec.json `target_column` must be a non-empty string.")
+        _fail(f"{SPEC_PATH} `target_column` must be a non-empty string.")
 
     if "test_data_file" in spec and (
         not isinstance(spec["test_data_file"], str) or not spec["test_data_file"].strip()
     ):
-        _fail("feature_spec.json `test_data_file` must be a non-empty string when set.")
+        _fail(f"{SPEC_PATH} `test_data_file` must be a non-empty string when set.")
     if "test_target_column" in spec and (
         not isinstance(spec["test_target_column"], str)
         or not spec["test_target_column"].strip()
     ):
-        _fail("feature_spec.json `test_target_column` must be a non-empty string when set.")
+        _fail(f"{SPEC_PATH} `test_target_column` must be a non-empty string when set.")
 
     if "row_filters" in spec and "train_row_filters" in spec:
-        _fail("Use either `row_filters` or `train_row_filters`, not both.")
+        _fail(f"Use either `row_filters` or `train_row_filters` in {SPEC_PATH}, not both.")
 
     spec["train_row_filters"] = validate_row_filters(
         spec.get("train_row_filters", spec.get("row_filters")),
@@ -244,9 +244,9 @@ def validate_spec(spec: dict) -> dict:
     spec["filter_specs"] = validate_column_specs(spec.get("filter_specs", []), "filter_specs")
 
     if spec.get("test_target_column") and not spec.get("test_data_file"):
-        _fail("feature_spec.json `test_target_column` requires `test_data_file`.")
+        _fail(f"{SPEC_PATH} `test_target_column` requires `test_data_file`.")
     if spec["test_row_filters"] and not spec.get("test_data_file"):
-        _fail("feature_spec.json `test_row_filters` requires `test_data_file`.")
+        _fail(f"{SPEC_PATH} `test_row_filters` requires `test_data_file`.")
 
     feature_columns = {feat["column"] for feat in spec["features"]}
     filter_spec_columns = {feat["column"] for feat in spec["filter_specs"]}
@@ -298,7 +298,7 @@ def load_table(file_path: str) -> pd.DataFrame:
             return df
     _fail(
         f"File not found at '{file_path}'.\n"
-        "          Update program.md / feature_spec.json and regenerate the prep spec."
+        f"          Update program.md / {SPEC_PATH} and regenerate the prep spec."
     )
 
 
