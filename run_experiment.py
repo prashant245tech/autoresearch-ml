@@ -954,47 +954,10 @@ def autonomous_loop(n: int):
     with open(META_PATH) as f:
         meta = json.load(f)
 
-    pending_candidate = None
-
     for i in range(n):
         print(f"\n{'═' * 60}")
         print(f"  LOOP {i + 1}/{n}")
         print(f"{'═' * 60}")
-
-        try:
-            entry = run_single_experiment()
-        except RuntimeError as exc:
-            print(f"[runner] ERROR: {exc}")
-            break
-
-        if pending_candidate is not None:
-            improved = (
-                entry.get("status") == STATUS_OK
-                and entry.get("mape") is not None
-                and entry["mape"] < pending_candidate["best_mape_before"]
-            )
-
-            if improved:
-                print(
-                    "[runner] Candidate improved MAPE "
-                    f"({entry['mape']:.2f}% < {pending_candidate['best_mape_before']:.2f}%)"
-                )
-                print(f"[runner] Keeping git commit {pending_candidate['commit']}")
-            else:
-                reason = entry.get("status", STATUS_TRAIN_FAILED)
-                print(f"[runner] Candidate rejected with status `{reason}`")
-                try:
-                    discard_candidate_commit()
-                    print(f"[runner] Discarded git commit {pending_candidate['commit']}")
-                    print(f"[runner] Reset train.py to accepted commit {current_head()}")
-                except RuntimeError as exc:
-                    print(f"[runner] ERROR: failed to discard candidate cleanly: {exc}")
-                    break
-            pending_candidate = None
-
-        if i == n - 1:
-            print("[runner] Final experiment complete.")
-            break
 
         print("[runner] Asking agent for next hypothesis...")
         with open(TRAIN_PATH) as f:
@@ -1052,13 +1015,41 @@ def autonomous_loop(n: int):
             print("[runner] Agent produced no train.py change — stopping loop")
             break
 
-        pending_candidate = {
-            "commit": commit_hash,
-            "best_mape_before": best_mape_before,
-        }
         print(f"[runner] Candidate committed as {commit_hash}")
 
         time.sleep(1)
+
+        try:
+            entry = run_single_experiment()
+        except RuntimeError as exc:
+            print(f"[runner] ERROR: {exc}")
+            break
+
+        improved = (
+            entry.get("status") == STATUS_OK
+            and entry.get("mape") is not None
+            and entry["mape"] < best_mape_before
+        )
+
+        if improved:
+            print(
+                "[runner] Candidate improved MAPE "
+                f"({entry['mape']:.2f}% < {best_mape_before:.2f}%)"
+            )
+            print(f"[runner] Keeping git commit {commit_hash}")
+        else:
+            reason = entry.get("status", STATUS_TRAIN_FAILED)
+            print(f"[runner] Candidate rejected with status `{reason}`")
+            try:
+                discard_candidate_commit()
+                print(f"[runner] Discarded git commit {commit_hash}")
+                print(f"[runner] Reset train.py to accepted commit {current_head()}")
+            except RuntimeError as exc:
+                print(f"[runner] ERROR: failed to discard candidate cleanly: {exc}")
+                break
+
+        if i == n - 1:
+            print("[runner] Final experiment complete.")
 
     print_summary()
 
