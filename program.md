@@ -6,7 +6,7 @@
 #   1. Fill in SECTION 1 — data file path and target column
 #   2. Describe your features in plain English in SECTION 2
 #   3. Run: python compile.py
-#      → reads your descriptions, calls Claude, produces feature_spec.json
+#      → reads your descriptions, calls an OpenAI-compatible LLM, produces feature_spec.json
 #   4. Run: python prepare.py  → cleans and splits your data
 #   5. Run: python train.py    → baseline experiment
 #   6. Iterate manually or: python run_experiment.py --n 10 --auto

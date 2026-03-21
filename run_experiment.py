@@ -35,6 +35,8 @@ from sklearn.linear_model import ElasticNet, Lasso, Ridge
 from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error, r2_score
 import xgboost as xgb
 
+from openai_compat import chat_completion_text, resolve_model
+
 RESULTS_PATH = "experiments/results.json"
 RESULTS_CSV_PATH = "experiments/results.csv"
 SESSION_STATE_PATH = "experiments/research_state.json"
@@ -70,6 +72,7 @@ SUPPORTED_MODEL_FAMILIES = {
     "extra_trees",
     "gradient_boosting",
 }
+DEFAULT_AGENT_MODEL = "gpt-4.1"
 
 
 class HarnessValidationError(Exception):
@@ -882,21 +885,9 @@ def discard_candidate_commit():
 
 
 def get_agent_suggestion(results: list, train_code: str, program_md: str, meta: dict) -> str:
-    try:
-        import anthropic
-    except ImportError:
-        sys.exit("[runner] anthropic package not installed. Run: pip install anthropic")
-
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        sys.exit(
-            "[runner] ANTHROPIC_API_KEY not set.\n"
-            "         export ANTHROPIC_API_KEY=sk-ant-..."
-        )
-
-    client = anthropic.Anthropic(api_key=api_key)
     history_str = json.dumps(results[-10:], indent=2)
     meta_str = json.dumps(meta, indent=2)
+    model = resolve_model(None, "AUTORESEARCH_LLM_MODEL", DEFAULT_AGENT_MODEL)
 
     prompt = f"""You are an ML research agent improving a price prediction model.
 
@@ -932,12 +923,13 @@ Hard constraints:
 - Return ONLY raw Python source, with no markdown fences or extra prose
 """
 
-    message = client.messages.create(
-        model="claude-sonnet-4-20250514",
+    return chat_completion_text(
+        task_label="runner",
+        system_prompt=None,
+        user_prompt=prompt,
+        model=model,
         max_tokens=4096,
-        messages=[{"role": "user", "content": prompt}],
     )
-    return message.content[0].text.strip()
 
 
 def autonomous_loop(n: int):
@@ -1073,7 +1065,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--auto",
         action="store_true",
-        help="Enable git-backed autonomous mode (requires ANTHROPIC_API_KEY)",
+        help="Enable git-backed autonomous mode (requires OPENAI_API_KEY)",
     )
     parser.add_argument("--summary", action="store_true", help="Print experiment history and exit")
     parser.add_argument("--best", action="store_true", help="Show best model details and exit")

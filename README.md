@@ -11,7 +11,7 @@ the best predictor for your target variable (default: corrugated box Price/MSF).
 ```
 corrugated_automl/
 ├── program.md          ← THE ONLY FILE YOU EDIT (plain English config + domain knowledge)
-├── compile.py          ← Reads program.md → calls Claude → produces feature_spec.json
+├── compile.py          ← Reads program.md → calls an OpenAI-compatible LLM → produces feature_spec.json
 ├── prepare.py          ← FIXED: reads feature_spec.json → cleans data → train/test split
 ├── train.py            ← THE ONLY research surface: description + features + model config
 ├── run_experiment.py   ← IMMUTABLE harness: budget, evaluation, logging, auto loop
@@ -61,13 +61,31 @@ Ink Coverage Bucket:
 ### Step 2 — Compile (once per program.md change)
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
+export OPENAI_API_KEY=sk-...
 python compile.py
 ```
 
-Claude reads your plain English descriptions and produces `feature_spec.json`
+The compiler reads your plain English descriptions and produces `feature_spec.json`
 with exact cleaning rules (null handling, encoding, clipping, consolidation).
 Review the printed summary — edit `feature_spec.json` directly if anything looks wrong.
+
+You can also put provider settings in a project-local `.env` file:
+
+```bash
+OPENAI_API_KEY=sk-...
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4.1-mini
+```
+
+To target another OpenAI-compatible backend, also set:
+
+```bash
+export OPENAI_BASE_URL=https://your-llm-endpoint/v1
+export OPENAI_MODEL=qwen/qwen3-32b
+```
+
+`OPENAI_MODEL` is the shared default. You can also use `COMPILE_LLM_MODEL`
+or `AUTORESEARCH_LLM_MODEL` to override the compiler and autonomous agent separately.
 
 ### Step 3 — Prepare data (once per data change)
 
@@ -102,7 +120,7 @@ git commit -m "Initial snapshot"
 python run_experiment.py --n 10 --auto
 ```
 
-Claude iterates automatically: reads experiment history + frozen metadata →
+The agent iterates automatically: reads experiment history + frozen metadata →
 proposes a new `train.py` → the harness validates that only the approved
 research surface changed → commits the candidate → runs a 5-minute experiment →
 keeps the commit if MAPE improves or resets `train.py` if it does not.

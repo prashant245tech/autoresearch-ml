@@ -1,14 +1,14 @@
 """
 compile.py — Translates natural language feature descriptions in program.md
-             into a structured feature_spec.json using Claude.
+             into a structured feature_spec.json using an OpenAI-compatible LLM.
 
 Usage:
-    python compile.py                  # Uses ANTHROPIC_API_KEY env var
-    python compile.py --preview        # Print spec without saving
-    python compile.py --model sonnet   # Force model (sonnet / haiku / opus)
+    python compile.py                          # Uses OPENAI_API_KEY env var
+    python compile.py --preview               # Print spec without saving
+    python compile.py --model qwen/qwen3-32b  # Force a specific model id
 
 Flow:
-    program.md  →  [Claude]  →  feature_spec.json  →  prepare.py
+    program.md  →  [OpenAI-compatible API]  →  feature_spec.json  →  prepare.py
 """
 
 import os
@@ -16,16 +16,13 @@ import re
 import sys
 import json
 import argparse
-import anthropic
+
+from openai_compat import chat_completion_text, resolve_model
 
 PROGRAM_MD    = "program.md"
 SPEC_OUT_PATH = "feature_spec.json"
 
-MODELS = {
-    "sonnet": "claude-sonnet-4-20250514",
-    "haiku":  "claude-haiku-4-5-20251001",
-    "opus":   "claude-opus-4-20250514",
-}
+DEFAULT_COMPILE_MODEL = "gpt-4.1-mini"
 
 # ─────────────────────────────────────────────────────────────
 # Parse sections from program.md
@@ -134,33 +131,19 @@ Translate each feature into the JSON spec. Return only the JSON object."""
 
 
 # ─────────────────────────────────────────────────────────────
-# Call Claude
+# Call OpenAI-compatible API
 # ─────────────────────────────────────────────────────────────
 
-def call_claude(features_text: str, target_col: str, model_key: str) -> dict:
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        sys.exit(
-            "[compile] ERROR: ANTHROPIC_API_KEY environment variable not set.\n"
-            "          export ANTHROPIC_API_KEY=sk-ant-..."
-        )
+def call_llm(features_text: str, target_col: str, model: str) -> dict:
+    print(f"[compile] Calling model `{model}` to codify feature descriptions...")
 
-    client   = anthropic.Anthropic(api_key=api_key)
-    model_id = MODELS.get(model_key, MODELS["sonnet"])
-
-    print(f"[compile] Calling Claude ({model_id}) to codify feature descriptions...")
-
-    message = client.messages.create(
-        model=model_id,
+    raw = chat_completion_text(
+        task_label="compile",
+        system_prompt=SYSTEM_PROMPT,
+        user_prompt=build_user_prompt(features_text, target_col),
+        model=model,
         max_tokens=4096,
-        system=SYSTEM_PROMPT,
-        messages=[{
-            "role": "user",
-            "content": build_user_prompt(features_text, target_col)
-        }]
     )
-
-    raw = message.content[0].text.strip()
 
     # Strip accidental markdown code fences
     if raw.startswith("```"):
@@ -170,11 +153,11 @@ def call_claude(features_text: str, target_col: str, model_key: str) -> dict:
     try:
         spec = json.loads(raw)
     except json.JSONDecodeError as e:
-        print(f"[compile] ERROR: Claude returned invalid JSON:\n{raw[:500]}")
+        print(f"[compile] ERROR: LLM returned invalid JSON:\n{raw[:500]}")
         sys.exit(f"JSON parse error: {e}")
 
     if "features" not in spec:
-        sys.exit("[compile] ERROR: Claude response missing top-level 'features' key")
+        sys.exit("[compile] ERROR: LLM response missing top-level 'features' key")
 
     return spec
 
@@ -234,9 +217,14 @@ def main():
     )
     parser.add_argument("--preview", action="store_true",
                         help="Print spec to stdout without saving")
-    parser.add_argument("--model",   default="sonnet",
-                        choices=list(MODELS.keys()),
-                        help="Claude model to use (default: sonnet)")
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "OpenAI-compatible model id to use "
+            f"(default: $COMPILE_LLM_MODEL, then $OPENAI_MODEL, then {DEFAULT_COMPILE_MODEL})"
+        ),
+    )
     args = parser.parse_args()
 
     # ── Read program.md ───────────────────────────────────────
@@ -260,8 +248,9 @@ def main():
     ]
     print(f"[compile] Features described: {feature_names}")
 
-    # ── Call Claude ───────────────────────────────────────────
-    feature_spec   = call_claude(features_text, cfg["target_column"], args.model)
+    # ── Call LLM ──────────────────────────────────────────────
+    model = resolve_model(args.model, "COMPILE_LLM_MODEL", DEFAULT_COMPILE_MODEL)
+    feature_spec   = call_llm(features_text, cfg["target_column"], model)
     full_spec      = build_full_spec(cfg, feature_spec, domain_context)
 
     # ── Output ────────────────────────────────────────────────
