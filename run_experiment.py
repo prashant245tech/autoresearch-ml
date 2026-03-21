@@ -1094,7 +1094,7 @@ if __name__ == "__main__":
         print_summary()
     elif args.best:
         show_best()
-    elif args.auto and args.n > 1:
+    elif args.auto:
         autonomous_loop(args.n)
     else:
         manual_loop(args.n)
