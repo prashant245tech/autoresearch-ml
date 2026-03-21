@@ -15,7 +15,7 @@ import pandas as pd
 
 
 EXPERIMENT_DESCRIPTION = (
-    "Model experiment: baseline bucket features with Extra Trees ensemble"
+    "Feature experiment: add quantity tier, setup proxy, and cross features to Extra Trees"
 )
 
 
@@ -35,6 +35,7 @@ def engineer_features(df: pd.DataFrame, meta: dict) -> pd.DataFrame:
         if col in df.columns:
             fe[col] = df[col]
 
+    # Base continuous features clipped properly
     if "SQ. FT. PER PC" in df.columns:
         sqft = df["SQ. FT. PER PC"].clip(lower=0.01)
         fe["sqft"] = sqft
@@ -45,6 +46,7 @@ def engineer_features(df: pd.DataFrame, meta: dict) -> pd.DataFrame:
         fe["qty_log"] = np.log1p(qty)
         fe["has_quantity"] = (qty > 0).astype(int)
 
+    # Encoded ordinals clipped non-negative (sentinel -1 already handled)
     if "Size Bucket_encoded" in df.columns:
         size_bucket = df["Size Bucket_encoded"].clip(lower=0)
         fe["size_bucket"] = size_bucket
@@ -53,26 +55,42 @@ def engineer_features(df: pd.DataFrame, meta: dict) -> pd.DataFrame:
         ink_bucket = df["Ink Coverage Bucket_encoded"].clip(lower=0)
         fe["ink_bucket"] = ink_bucket
 
+    # Add quantity tier categorical feature as ordinal bins of quantity
+    if "Quantity" in df.columns:
+        bins = [-1, 0, 500, 1000, 2500, 5000, 10000, np.inf]
+        qty_tier = pd.cut(df["Quantity"], bins=bins, labels=False).fillna(-1).astype(int)
+        fe["qty_tier"] = qty_tier.clip(lower=0)
+
+    # Setup proxy for fixed cost amortization (inversely proportional to area * qty_log)
     if "sqft" in fe.columns and "qty_log" in fe.columns:
+        denom = fe["sqft"] * fe["qty_log"] + 1.0
+        fe["setup_proxy"] = 1.0 / denom
         fe["area_x_qty"] = fe["sqft"] * fe["qty_log"]
 
+    # Cross features suggested by domain knowledge
     if "sqft" in fe.columns and "Flute 1_encoded" in df.columns:
-        fe["area_x_flute"] = fe["sqft"] * df["Flute 1_encoded"].clip(lower=0)
-
+        flute = df["Flute 1_encoded"].clip(lower=0)
+        fe["area_x_flute"] = fe["sqft"] * flute
+        if "size_bucket" in fe.columns:
+            fe["flute_x_size_bucket"] = flute * fe["size_bucket"]
     if "sqft" in fe.columns and "ink_bucket" in fe.columns:
         fe["area_x_ink_bucket"] = fe["sqft"] * fe["ink_bucket"]
-
-    if "sqft" in fe.columns and "size_bucket" in fe.columns:
+        if "size_bucket" in fe.columns:
+            fe["size_x_ink_bucket"] = fe["size_bucket"] * fe["ink_bucket"]
+    if "size_bucket" in fe.columns and "qty_log" in fe.columns:
         fe["area_x_size_bucket"] = fe["sqft"] * fe["size_bucket"]
-
-    if "qty_log" in fe.columns and "size_bucket" in fe.columns:
         fe["qty_x_size_bucket"] = fe["qty_log"] * fe["size_bucket"]
-
     if "qty_log" in fe.columns and "ink_bucket" in fe.columns:
         fe["qty_x_ink_bucket"] = fe["qty_log"] * fe["ink_bucket"]
 
     if "Tare Weight" in df.columns and "sqft" in fe.columns:
         fe["weight_per_sqft"] = df["Tare Weight"] / (fe["sqft"] + 1e-6)
+        # Add log tare weight to capture diminishing returns of weight effect
+        fe["log_tare_weight"] = np.log1p(df["Tare Weight"].clip(lower=0.001))
+
+    # Add catalog price flag (has_quantity already added)
+    if "Quantity" in df.columns:
+        fe["is_catalog_price"] = (df["Quantity"] == 0).astype(int)
 
     return fe
 
@@ -94,10 +112,12 @@ def get_model_config() -> dict:
     return {
         "family": "extra_trees",
         "params": {
-            "n_estimators": 500,
-            "max_depth": 16,
-            "min_samples_leaf": 2,
-            "max_features": 0.8,
+            "n_estimators": 700,
+            "max_depth": 20,
+            "min_samples_leaf": 1,
+            "max_features": 0.9,
+            "random_state": 42,
+            "n_jobs": -1,
         },
     }
 
