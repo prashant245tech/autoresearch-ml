@@ -134,3 +134,14 @@ Those responsibilities belong to the external agent or your surrounding workflow
 - `prepare.py` can either split one source dataset or consume an explicit test dataset.
 - The accepted artifact is retrained on all non-test training data.
 - `experiments/session_baseline.json` is the enforced freeze-point for the prepared data.
+
+## Tests
+
+Run the framework tests with:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The suite uses temporary workspaces, so it does not touch your local
+`config/feature_spec.json`, prepared parquet files, or accepted-model artifacts.
