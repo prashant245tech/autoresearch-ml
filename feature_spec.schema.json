@@ -1,0 +1,341 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/feature_spec.schema.json",
+  "title": "Feature Spec",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "data_file",
+    "target_column",
+    "features"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "minLength": 1
+    },
+    "version": {
+      "type": [
+        "string",
+        "number"
+      ]
+    },
+    "data_file": {
+      "type": "string",
+      "minLength": 1
+    },
+    "target_column": {
+      "type": "string",
+      "minLength": 1
+    },
+    "test_data_file": {
+      "type": "string",
+      "minLength": 1
+    },
+    "test_target_column": {
+      "type": "string",
+      "minLength": 1
+    },
+    "test_size": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "exclusiveMaximum": 1
+    },
+    "random_state": {
+      "type": "integer"
+    },
+    "outlier_iqr_k": {
+      "type": "number",
+      "minimum": 0
+    },
+    "domain_context": {
+      "type": "string"
+    },
+    "row_filters": {
+      "$ref": "#/$defs/filterList"
+    },
+    "train_row_filters": {
+      "$ref": "#/$defs/filterList"
+    },
+    "test_row_filters": {
+      "$ref": "#/$defs/filterList"
+    },
+    "filter_specs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/filterSpec"
+      }
+    },
+    "features": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/feature"
+      }
+    }
+  },
+  "allOf": [
+    {
+      "not": {
+        "required": [
+          "row_filters",
+          "train_row_filters"
+        ]
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "test_target_column"
+        ]
+      },
+      "then": {
+        "required": [
+          "test_data_file"
+        ]
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "test_row_filters"
+        ]
+      },
+      "then": {
+        "required": [
+          "test_data_file"
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "filterValue": {
+      "type": [
+        "string",
+        "number",
+        "integer",
+        "boolean",
+        "null"
+      ]
+    },
+    "filter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "column",
+        "op"
+      ],
+      "properties": {
+        "column": {
+          "type": "string",
+          "minLength": 1
+        },
+        "op": {
+          "type": "string",
+          "enum": [
+            "eq",
+            "ne",
+            "in",
+            "not_in",
+            "gt",
+            "gte",
+            "lt",
+            "lte",
+            "contains",
+            "is_null",
+            "not_null"
+          ]
+        },
+        "value": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/filterValue"
+            },
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/filterValue"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "filterList": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/filter"
+      }
+    },
+    "fillNull": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "strategy"
+      ],
+      "properties": {
+        "strategy": {
+          "type": "string",
+          "enum": [
+            "value",
+            "median",
+            "mean",
+            "mode",
+            "none"
+          ]
+        },
+        "value": {}
+      }
+    },
+    "clip": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "min": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      }
+    },
+    "feature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "column",
+        "type"
+      ],
+      "properties": {
+        "column": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "numeric",
+            "ordinal",
+            "categorical",
+            "boolean"
+          ]
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "drop_if_null": {
+          "type": "boolean"
+        },
+        "fill_null": {
+          "$ref": "#/$defs/fillNull"
+        },
+        "clip": {
+          "$ref": "#/$defs/clip"
+        },
+        "normalise": {
+          "type": "string",
+          "enum": [
+            "none",
+            "uppercase_strip"
+          ]
+        },
+        "ordinal_order": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": [
+              "string",
+              "number",
+              "integer"
+            ]
+          }
+        },
+        "categorical_consolidation": {
+          "type": "object",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "number",
+              "integer",
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "unknown_sentinel": {},
+        "notes": {
+          "type": "string"
+        }
+      }
+    },
+    "filterSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "column",
+        "type"
+      ],
+      "properties": {
+        "column": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "numeric",
+            "ordinal",
+            "categorical",
+            "boolean"
+          ]
+        },
+        "fill_null": {
+          "$ref": "#/$defs/fillNull"
+        },
+        "clip": {
+          "$ref": "#/$defs/clip"
+        },
+        "normalise": {
+          "type": "string",
+          "enum": [
+            "none",
+            "uppercase_strip"
+          ]
+        },
+        "ordinal_order": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": [
+              "string",
+              "number",
+              "integer"
+            ]
+          }
+        },
+        "categorical_consolidation": {
+          "type": "object",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "number",
+              "integer",
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "unknown_sentinel": {},
+        "notes": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

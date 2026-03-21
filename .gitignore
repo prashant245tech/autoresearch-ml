@@ -2,3 +2,5 @@
 __pycache__/
 .DS_Store
 .env
+models/accepted/
+experiments/session_baseline.json

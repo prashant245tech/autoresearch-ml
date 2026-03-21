@@ -1,21 +1,28 @@
 """
-train.py — Research spec for corrugated box price prediction.
+train.py - Editable experiment program for the current ML tuning task.
 
-Edit only the mutable research surface below:
+The external agent edits only this file while the deterministic runner in
+`run_experiment.py` owns data splitting, validation scoring, and acceptance/export.
+
+Required hooks:
 1. `EXPERIMENT_DESCRIPTION`
 2. `engineer_features(df, meta)`
-3. `get_model_config()`
+3. `build_model(meta)`
 
-The immutable execution harness, evaluation rules, logging, and git workflow
-live in `run_experiment.py`.
+Optional hooks:
+4. `fit_model(model, X_train, y_train, X_val, y_val)`
+5. `predict_model(model, X)`
 """
 
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import ExtraTreesRegressor
 
 
 EXPERIMENT_DESCRIPTION = (
-    "Feature experiment: add quantity tier, setup proxy, and cross features to Extra Trees"
+    "change_type=feature_probe | family=ExtraTrees | "
+    "change=add back log_total_board only on the simplified TreeHouse MODEL feature block | "
+    "hypothesis=aggregate board consumption may still help without the noisier mass-based proxies"
 )
 
 
@@ -36,9 +43,9 @@ def engineer_features(df: pd.DataFrame, meta: dict) -> pd.DataFrame:
             fe[col] = df[col]
 
     # Base continuous features clipped properly
+    sqft = None
     if "SQ. FT. PER PC" in df.columns:
         sqft = df["SQ. FT. PER PC"].clip(lower=0.01)
-        fe["sqft"] = sqft
         fe["log_sqft"] = np.log1p(sqft)
 
     if "Quantity" in df.columns:
@@ -47,13 +54,13 @@ def engineer_features(df: pd.DataFrame, meta: dict) -> pd.DataFrame:
         fe["has_quantity"] = (qty > 0).astype(int)
 
     # Encoded ordinals clipped non-negative (sentinel -1 already handled)
+    size_bucket = None
     if "Size Bucket_encoded" in df.columns:
         size_bucket = df["Size Bucket_encoded"].clip(lower=0)
-        fe["size_bucket"] = size_bucket
 
+    ink_bucket = None
     if "Ink Coverage Bucket_encoded" in df.columns:
         ink_bucket = df["Ink Coverage Bucket_encoded"].clip(lower=0)
-        fe["ink_bucket"] = ink_bucket
 
     # Add quantity tier categorical feature as ordinal bins of quantity
     if "Quantity" in df.columns:
@@ -62,29 +69,31 @@ def engineer_features(df: pd.DataFrame, meta: dict) -> pd.DataFrame:
         fe["qty_tier"] = qty_tier.clip(lower=0)
 
     # Setup proxy for fixed cost amortization (inversely proportional to area * qty_log)
-    if "sqft" in fe.columns and "qty_log" in fe.columns:
-        denom = fe["sqft"] * fe["qty_log"] + 1.0
+    if sqft is not None and "qty_log" in fe.columns:
+        denom = sqft * fe["qty_log"] + 1.0
         fe["setup_proxy"] = 1.0 / denom
-        fe["area_x_qty"] = fe["sqft"] * fe["qty_log"]
+        fe["area_x_qty"] = sqft * fe["qty_log"]
+        total_board = sqft * df["Quantity"].clip(lower=0)
+        fe["log_total_board"] = np.log1p(total_board)
 
     # Cross features suggested by domain knowledge
-    if "sqft" in fe.columns and "Flute 1_encoded" in df.columns:
+    if sqft is not None and "Flute 1_encoded" in df.columns:
         flute = df["Flute 1_encoded"].clip(lower=0)
-        fe["area_x_flute"] = fe["sqft"] * flute
-        if "size_bucket" in fe.columns:
-            fe["flute_x_size_bucket"] = flute * fe["size_bucket"]
-    if "sqft" in fe.columns and "ink_bucket" in fe.columns:
-        fe["area_x_ink_bucket"] = fe["sqft"] * fe["ink_bucket"]
-        if "size_bucket" in fe.columns:
-            fe["size_x_ink_bucket"] = fe["size_bucket"] * fe["ink_bucket"]
-    if "size_bucket" in fe.columns and "qty_log" in fe.columns:
-        fe["area_x_size_bucket"] = fe["sqft"] * fe["size_bucket"]
-        fe["qty_x_size_bucket"] = fe["qty_log"] * fe["size_bucket"]
-    if "qty_log" in fe.columns and "ink_bucket" in fe.columns:
-        fe["qty_x_ink_bucket"] = fe["qty_log"] * fe["ink_bucket"]
+        fe["area_x_flute"] = sqft * flute
+        if size_bucket is not None:
+            fe["flute_x_size_bucket"] = flute * size_bucket
+    if sqft is not None and ink_bucket is not None:
+        fe["area_x_ink_bucket"] = sqft * ink_bucket
+        if size_bucket is not None:
+            fe["size_x_ink_bucket"] = size_bucket * ink_bucket
+    if size_bucket is not None and "qty_log" in fe.columns and sqft is not None:
+        fe["area_x_size_bucket"] = sqft * size_bucket
+        fe["qty_x_size_bucket"] = fe["qty_log"] * size_bucket
+    if "qty_log" in fe.columns and ink_bucket is not None:
+        fe["qty_x_ink_bucket"] = fe["qty_log"] * ink_bucket
 
-    if "Tare Weight" in df.columns and "sqft" in fe.columns:
-        fe["weight_per_sqft"] = df["Tare Weight"] / (fe["sqft"] + 1e-6)
+    if "Tare Weight" in df.columns and sqft is not None:
+        fe["weight_per_sqft"] = df["Tare Weight"] / (sqft + 1e-6)
         # Add log tare weight to capture diminishing returns of weight effect
         fe["log_tare_weight"] = np.log1p(df["Tare Weight"].clip(lower=0.001))
 
@@ -95,31 +104,36 @@ def engineer_features(df: pd.DataFrame, meta: dict) -> pd.DataFrame:
     return fe
 
 
-def get_model_config() -> dict:
+def build_model(meta: dict):
     """
-    Return a declarative model config for the immutable harness.
+    Return the actual estimator object for the immutable harness to fit.
+    """
+    return ExtraTreesRegressor(
+        n_estimators=900,
+        max_depth=20,
+        min_samples_leaf=1,
+        max_features=0.65,
+        criterion="absolute_error",
+        random_state=42,
+        n_jobs=-1,
+    )
 
-    Supported families:
-    - xgboost
-    - lightgbm
-    - ridge
-    - lasso
-    - elasticnet
-    - random_forest
-    - extra_trees
-    - gradient_boosting
+
+def fit_model(model, X_train, y_train, X_val, y_val):
     """
-    return {
-        "family": "extra_trees",
-        "params": {
-            "n_estimators": 700,
-            "max_depth": 20,
-            "min_samples_leaf": 1,
-            "max_features": 0.9,
-            "random_state": 42,
-            "n_jobs": -1,
-        },
-    }
+    Optional hook for custom training behavior.
+
+    Validation metrics are still computed in run_experiment.py.
+    """
+    model.fit(X_train, np.log1p(y_train))
+    return model
+
+
+def predict_model(model, X):
+    """
+    Optional hook for custom prediction behavior.
+    """
+    return np.expm1(model.predict(X))
 
 
 if __name__ == "__main__":

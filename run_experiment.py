@@ -1,329 +1,196 @@
 """
-run_experiment.py — Immutable experiment harness for corrugated price prediction.
+run_experiment.py - Deterministic experiment runner for editable ML training specs.
 
 This file owns:
 - prepared-data loading
-- experiment budget enforcement
-- evaluation and logging
-- git keep/discard semantics for autonomous mode
+- deterministic train/validation splitting
+- validation scoring under a fixed budget
+- acceptance/export of a selected train.py variant
 
-The only mutable research surface is `train.py`.
+This file does not own:
+- LLM calls
+- git workflow
+- experiment history
+- best-model state
 """
 
 import argparse
 import ast
 from datetime import datetime
 import hashlib
-import importlib.util
+import inspect
 import json
 import multiprocessing as mp
-from queue import Empty
 import os
-import re
+from pathlib import Path
+from queue import Empty
 import shutil
-import subprocess
 import sys
-import tempfile
 import time
+from types import ModuleType
 from typing import Optional
 
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import ExtraTreesRegressor, GradientBoostingRegressor, RandomForestRegressor
-from sklearn.linear_model import ElasticNet, Lasso, Ridge
 from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error, r2_score
-import xgboost as xgb
+from sklearn.model_selection import train_test_split
 
-from openai_compat import chat_completion_text, resolve_model
-
-RESULTS_PATH = "experiments/results.json"
-RESULTS_CSV_PATH = "experiments/results.csv"
-SESSION_STATE_PATH = "experiments/research_state.json"
 TRAIN_PATH = "train.py"
-PROGRAM_MD = "program.md"
 META_PATH = "data/columns.json"
 TRAIN_DATA_PATH = "data/train.parquet"
 TEST_DATA_PATH = "data/test.parquet"
+ACCEPTED_MODELS_DIR = "models/accepted"
+SESSION_BASELINE_PATH = "experiments/session_baseline.json"
 EXPERIMENT_BUDGET_S = 300
-MODEL_PATH = "models/best_model.pkl"
-FEATURES_PATH = "models/best_features.pkl"
-BEST_TRAIN_SPEC_PATH = "models/best_train.py"
-FROZEN_INPUT_PATHS = [
-    "compile.py",
-    "feature_spec.json",
-    "prepare.py",
-    TRAIN_DATA_PATH,
-    TEST_DATA_PATH,
-    META_PATH,
-]
+VALIDATION_SPLIT_SIZE = 0.2
+VALIDATION_RANDOM_STATE = 42
+
 STATUS_OK = "ok"
 STATUS_BUDGET_EXCEEDED = "budget_exceeded"
 STATUS_INVALID_CANDIDATE = "invalid_candidate"
-STATUS_IMMUTABLE_VIOLATION = "immutable_violation"
 STATUS_TRAIN_FAILED = "train_failed"
-SUPPORTED_MODEL_FAMILIES = {
-    "xgboost",
-    "lightgbm",
-    "ridge",
-    "lasso",
-    "elasticnet",
-    "random_forest",
-    "extra_trees",
-    "gradient_boosting",
-}
-DEFAULT_AGENT_MODEL = "gpt-4.1"
+STATUS_HASH_MISMATCH = "hash_mismatch"
+STATUS_PREPARED_DATA_MISMATCH = "prepared_data_mismatch"
 
 
 class HarnessValidationError(Exception):
     status = STATUS_INVALID_CANDIDATE
 
 
-class ImmutableViolationError(HarnessValidationError):
-    status = STATUS_IMMUTABLE_VIOLATION
-
-
 class InvalidCandidateError(HarnessValidationError):
     status = STATUS_INVALID_CANDIDATE
 
 
-def load_results() -> list:
-    if os.path.exists(RESULTS_PATH):
-        with open(RESULTS_PATH) as f:
-            return json.load(f)
-    return []
+class HashMismatchError(HarnessValidationError):
+    status = STATUS_HASH_MISMATCH
 
 
-def git(args, check: bool = True) -> subprocess.CompletedProcess:
-    result = subprocess.run(
-        ["git", *args],
-        capture_output=True,
-        text=True,
-    )
-    if check and result.returncode != 0:
-        msg = result.stderr.strip() or result.stdout.strip() or "git command failed"
-        raise RuntimeError(msg)
-    return result
+class PreparedDataMismatchError(HarnessValidationError):
+    status = STATUS_PREPARED_DATA_MISMATCH
 
 
-def in_git_repo() -> bool:
-    return git(["rev-parse", "--is-inside-work-tree"], check=False).returncode == 0
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
-def current_head() -> str:
-    return git(["rev-parse", "--short", "HEAD"]).stdout.strip()
-
-
-def current_branch() -> str:
-    return git(["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
-
-
-def train_file_dirty() -> bool:
-    return bool(git(["status", "--porcelain", "--", TRAIN_PATH]).stdout.strip())
-
-
-def ensure_git_ready():
-    if not in_git_repo():
-        sys.exit(
-            "[runner] ERROR: --auto requires a git repository.\n"
-            "         Run: git init && git add . && git commit -m 'Initial snapshot'"
-        )
-
-    branch = current_branch()
-    if train_file_dirty():
-        print("[runner] Snapshotting current train.py into git before autonomous loop...")
-        try:
-            git(["add", "--", TRAIN_PATH])
-            git(["commit", "-m", "autoresearch: baseline train.py snapshot", "--", TRAIN_PATH])
-        except RuntimeError as exc:
-            sys.exit(
-                "[runner] ERROR: Failed to commit the current train.py baseline.\n"
-                f"         {exc}"
-            )
-
-    print(f"[runner] Git branch: {branch}")
-    print(f"[runner] Accepted train.py baseline: {current_head()}")
+def sha256_text(text: str) -> str:
+    return sha256_bytes(text.encode("utf-8"))
 
 
 def sha256_file(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def snapshot_frozen_inputs() -> dict:
-    snapshot = {}
-    missing = [path for path in FROZEN_INPUT_PATHS if not os.path.exists(path)]
-    if missing:
-        raise RuntimeError(
-            "Missing prepared research inputs: "
-            + ", ".join(missing)
-            + ". Run compile.py / prepare.py first."
-        )
-
-    for path in FROZEN_INPUT_PATHS:
-        snapshot[path] = sha256_file(path)
-    return snapshot
+def print_json(payload: dict) -> None:
+    print(json.dumps(payload, indent=2, sort_keys=True))
 
 
-def ensure_research_session():
-    os.makedirs("experiments", exist_ok=True)
-    current_snapshot = snapshot_frozen_inputs()
-
-    if not os.path.exists(SESSION_STATE_PATH):
-        state = {
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "budget_s": EXPERIMENT_BUDGET_S,
-            "frozen_inputs": current_snapshot,
-        }
-        with open(SESSION_STATE_PATH, "w") as f:
-            json.dump(state, f, indent=2)
-        print(f"[runner] Created research session baseline → {SESSION_STATE_PATH}")
-        return state
-
-    with open(SESSION_STATE_PATH) as f:
-        state = json.load(f)
-
-    baseline = state.get("frozen_inputs", {})
-    mismatches = [path for path, digest in current_snapshot.items() if baseline.get(path) != digest]
-    if mismatches:
-        mismatch_str = ", ".join(mismatches)
-        raise RuntimeError(
-            "Frozen research inputs changed since the session baseline: "
-            f"{mismatch_str}. Re-run setup, then delete {SESSION_STATE_PATH} to start a new "
-            "research session."
-        )
-
-    return state
+def make_output_dir(train_sha: str) -> str:
+    return os.path.join(ACCEPTED_MODELS_DIR, train_sha[:12])
 
 
-def load_prepared_data():
+def current_timestamp() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def json_safe(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): json_safe(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, set):
+        return [json_safe(item) for item in sorted(value, key=repr)]
+    if callable(value):
+        return getattr(value, "__name__", repr(value))
+    return repr(value)
+
+
+def _baseline_payload(fingerprints: dict) -> dict:
+    return {
+        "created_at": current_timestamp(),
+        "prepared_data": fingerprints,
+    }
+
+
+def load_prepared_data() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     for path in [TRAIN_DATA_PATH, TEST_DATA_PATH, META_PATH]:
         if not os.path.exists(path):
             raise RuntimeError(f"{path} not found. Run prepare.py first.")
 
-    train = pd.read_parquet(TRAIN_DATA_PATH)
-    test = pd.read_parquet(TEST_DATA_PATH)
-    with open(META_PATH) as f:
-        meta = json.load(f)
-    return train, test, meta
+    train_df = pd.read_parquet(TRAIN_DATA_PATH)
+    test_df = pd.read_parquet(TEST_DATA_PATH)
+    with open(META_PATH) as handle:
+        meta = json.load(handle)
+    return train_df, test_df, meta
 
 
-def _is_docstring_expr(node) -> bool:
-    return (
-        isinstance(node, ast.Expr)
-        and isinstance(node.value, ast.Constant)
-        and isinstance(node.value.value, str)
+def prepared_data_fingerprints() -> dict:
+    fingerprints = {
+        "train_data_sha": sha256_file(TRAIN_DATA_PATH),
+        "test_data_sha": sha256_file(TEST_DATA_PATH),
+        "meta_sha": sha256_file(META_PATH),
+    }
+    fingerprints["prepared_data_sha"] = sha256_text(
+        json.dumps(fingerprints, sort_keys=True)
     )
+    return fingerprints
 
 
-def _validate_import(node, module_name: str, alias_name: str):
-    if not isinstance(node, ast.Import) or len(node.names) != 1:
-        raise ImmutableViolationError(
-            f"Immutable train.py header changed. Expected `import {module_name} as {alias_name}`."
-        )
-    alias = node.names[0]
-    if alias.name != module_name or alias.asname != alias_name:
-        raise ImmutableViolationError(
-            f"Immutable train.py header changed. Expected `import {module_name} as {alias_name}`."
-        )
+def ensure_prepared_data_baseline() -> dict:
+    fingerprints = prepared_data_fingerprints()
+    os.makedirs("experiments", exist_ok=True)
 
+    if not os.path.exists(SESSION_BASELINE_PATH):
+        with open(SESSION_BASELINE_PATH, "w") as handle:
+            json.dump(_baseline_payload(fingerprints), handle, indent=2, sort_keys=True)
+        return fingerprints
 
-def _validate_description_assignment(node):
-    if not isinstance(node, ast.Assign) or len(node.targets) != 1:
-        raise ImmutableViolationError(
-            "Immutable train.py structure changed around EXPERIMENT_DESCRIPTION."
-        )
-    target = node.targets[0]
-    if not isinstance(target, ast.Name) or target.id != "EXPERIMENT_DESCRIPTION":
-        raise ImmutableViolationError(
-            "Immutable train.py structure changed around EXPERIMENT_DESCRIPTION."
-        )
+    with open(SESSION_BASELINE_PATH) as handle:
+        baseline = json.load(handle)
 
-
-def _validate_function_signature(node, name: str, arg_names: list):
-    if not isinstance(node, ast.FunctionDef) or node.name != name:
-        raise ImmutableViolationError(f"Expected immutable train.py structure for `{name}`.")
-    if node.decorator_list:
-        raise ImmutableViolationError(f"`{name}` may not use decorators.")
-    actual_args = [arg.arg for arg in node.args.args]
-    if actual_args != arg_names:
-        raise ImmutableViolationError(
-            f"`{name}` must keep the immutable signature `{name}({', '.join(arg_names)})`."
+    baseline_fingerprints = baseline.get("prepared_data", {})
+    mismatch_keys = [
+        key
+        for key, current_value in fingerprints.items()
+        if baseline_fingerprints.get(key) != current_value
+    ]
+    if mismatch_keys:
+        mismatch_lines = ", ".join(mismatch_keys)
+        raise PreparedDataMismatchError(
+            "Prepared data changed since the session baseline "
+            f"({mismatch_lines}). Delete {SESSION_BASELINE_PATH} after rerunning prepare.py "
+            "to start a new tuning session."
         )
 
-
-def _validate_main_guard(node):
-    if not isinstance(node, ast.If):
-        raise ImmutableViolationError("train.py must keep the immutable __main__ entrypoint.")
-    test = node.test
-    if not (
-        isinstance(test, ast.Compare)
-        and isinstance(test.left, ast.Name)
-        and test.left.id == "__name__"
-        and len(test.ops) == 1
-        and isinstance(test.ops[0], ast.Eq)
-        and len(test.comparators) == 1
-        and isinstance(test.comparators[0], ast.Constant)
-        and test.comparators[0].value == "__main__"
-    ):
-        raise ImmutableViolationError("train.py must keep the immutable __main__ entrypoint.")
-
-    if len(node.body) != 2:
-        raise ImmutableViolationError("train.py __main__ entrypoint may not be modified.")
-
-    import_stmt, call_stmt = node.body
-    if not (
-        isinstance(import_stmt, ast.ImportFrom)
-        and import_stmt.module == "run_experiment"
-        and len(import_stmt.names) == 1
-        and import_stmt.names[0].name == "run_single_from_train_entrypoint"
-    ):
-        raise ImmutableViolationError("train.py __main__ entrypoint may not be modified.")
-
-    if not (
-        isinstance(call_stmt, ast.Expr)
-        and isinstance(call_stmt.value, ast.Call)
-        and isinstance(call_stmt.value.func, ast.Name)
-        and call_stmt.value.func.id == "run_single_from_train_entrypoint"
-        and not call_stmt.value.args
-        and not call_stmt.value.keywords
-    ):
-        raise ImmutableViolationError("train.py __main__ entrypoint may not be modified.")
+    return fingerprints
 
 
-def validate_train_source(train_code: str):
-    try:
-        tree = ast.parse(train_code, filename=TRAIN_PATH)
-    except SyntaxError as exc:
-        raise InvalidCandidateError(f"train.py is not valid Python: {exc}") from exc
-
-    body = list(tree.body)
-    if body and _is_docstring_expr(body[0]):
-        body = body[1:]
-
-    if len(body) != 6:
-        raise ImmutableViolationError(
-            "Only the immutable header plus EXPERIMENT_DESCRIPTION, engineer_features, "
-            "and get_model_config are allowed in train.py."
-        )
-
-    _validate_import(body[0], "numpy", "np")
-    _validate_import(body[1], "pandas", "pd")
-    _validate_description_assignment(body[2])
-    _validate_function_signature(body[3], "engineer_features", ["df", "meta"])
-    _validate_function_signature(body[4], "get_model_config", [])
-    _validate_main_guard(body[5])
+def split_train_for_validation(train_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    fit_train_df, val_df = train_test_split(
+        train_df,
+        test_size=VALIDATION_SPLIT_SIZE,
+        random_state=VALIDATION_RANDOM_STATE,
+        shuffle=True,
+    )
+    return fit_train_df.reset_index(drop=True), val_df.reset_index(drop=True)
 
 
 def extract_description_from_source(train_code: str) -> str:
     try:
         tree = ast.parse(train_code, filename=TRAIN_PATH)
     except SyntaxError:
-        match = re.search(r'EXPERIMENT_DESCRIPTION\s*=\s*\(\s*"([^"]+)"', train_code, re.DOTALL)
-        return match.group(1).strip() if match else "unparseable train.py"
+        return "experiment description unavailable"
 
     for node in tree.body:
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
@@ -333,751 +200,532 @@ def extract_description_from_source(train_code: str) -> str:
                     value = ast.literal_eval(node.value)
                 except Exception:
                     return "experiment description unavailable"
-                if isinstance(value, str):
+                if isinstance(value, str) and value.strip():
                     return " ".join(value.split())
     return "experiment description unavailable"
 
 
-def load_train_spec():
-    with open(TRAIN_PATH) as f:
-        train_code = f.read()
-
-    validate_train_source(train_code)
-
-    module_name = f"train_runtime_{int(time.time() * 1000000)}"
-    spec = importlib.util.spec_from_file_location(module_name, TRAIN_PATH)
-    module = importlib.util.module_from_spec(spec)
-    if spec.loader is None:
-        raise RuntimeError("Failed to load train.py module.")
-    spec.loader.exec_module(module)
-    return module, train_code
-
-
-def normalize_model_config(raw_config: dict) -> dict:
-    if not isinstance(raw_config, dict):
-        raise InvalidCandidateError("get_model_config() must return a dict.")
-
-    family = raw_config.get("family")
-    params = raw_config.get("params", {})
-
-    if not isinstance(family, str):
-        raise InvalidCandidateError("Model config must include a string `family`.")
-    if family not in SUPPORTED_MODEL_FAMILIES:
+def _validate_callable_signature(fn, name: str, expected_args: list[str]) -> None:
+    signature = inspect.signature(fn)
+    actual_args = [
+        param.name
+        for param in signature.parameters.values()
+        if param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    if actual_args[: len(expected_args)] != expected_args:
         raise InvalidCandidateError(
-            f"Unsupported model family `{family}`. Supported families: "
-            + ", ".join(sorted(SUPPORTED_MODEL_FAMILIES))
+            f"{name} must keep the signature {name}({', '.join(expected_args)})."
         )
-    if not isinstance(params, dict):
-        raise InvalidCandidateError("Model config `params` must be a dict.")
-
-    return {"family": family, "params": params}
 
 
-def build_model(model_config: dict):
-    family = model_config["family"]
-    params = dict(model_config.get("params", {}))
+def validate_train_module(module) -> None:
+    description = getattr(module, "EXPERIMENT_DESCRIPTION", None)
+    if not isinstance(description, str) or not description.strip():
+        raise InvalidCandidateError("train.py must define a non-empty EXPERIMENT_DESCRIPTION.")
 
-    if family == "xgboost":
-        defaults = {
-            "n_estimators": 300,
-            "learning_rate": 0.05,
-            "max_depth": 5,
-            "subsample": 0.8,
-            "colsample_bytree": 0.8,
-            "min_child_weight": 3,
-            "random_state": 42,
-            "n_jobs": 1,
-            "verbosity": 0,
-        }
-        defaults.update(params)
-        defaults["random_state"] = 42
-        defaults["n_jobs"] = 1
-        defaults["verbosity"] = 0
-        return xgb.XGBRegressor(**defaults)
+    engineer_features = getattr(module, "engineer_features", None)
+    if not callable(engineer_features):
+        raise InvalidCandidateError("train.py must define engineer_features(df, meta).")
+    _validate_callable_signature(engineer_features, "engineer_features", ["df", "meta"])
 
-    if family == "lightgbm":
-        try:
-            import lightgbm as lgb
-        except OSError as exc:
-            raise RuntimeError(
-                "lightgbm requires libomp on this machine. Install libomp or use another "
-                f"model family. Original error: {exc}"
-            ) from exc
-        defaults = {
-            "n_estimators": 300,
-            "learning_rate": 0.05,
-            "max_depth": -1,
-            "num_leaves": 31,
-            "subsample": 0.8,
-            "colsample_bytree": 0.8,
-            "random_state": 42,
-            "n_jobs": 1,
-            "verbose": -1,
-        }
-        defaults.update(params)
-        defaults["random_state"] = 42
-        defaults["n_jobs"] = 1
-        defaults["verbose"] = -1
-        return lgb.LGBMRegressor(**defaults)
+    build_model = getattr(module, "build_model", None)
+    if not callable(build_model):
+        raise InvalidCandidateError("train.py must define build_model(meta).")
+    _validate_callable_signature(build_model, "build_model", ["meta"])
 
-    if family == "ridge":
-        defaults = {"alpha": 1.0}
-        defaults.update(params)
-        return Ridge(**defaults)
+    fit_model = getattr(module, "fit_model", None)
+    if fit_model is not None:
+        if not callable(fit_model):
+            raise InvalidCandidateError("fit_model must be callable when defined.")
+        _validate_callable_signature(
+            fit_model,
+            "fit_model",
+            ["model", "X_train", "y_train", "X_val", "y_val"],
+        )
 
-    if family == "lasso":
-        defaults = {"alpha": 0.001, "max_iter": 20000}
-        defaults.update(params)
-        return Lasso(**defaults)
+    predict_model = getattr(module, "predict_model", None)
+    if predict_model is not None:
+        if not callable(predict_model):
+            raise InvalidCandidateError("predict_model must be callable when defined.")
+        _validate_callable_signature(predict_model, "predict_model", ["model", "X"])
 
-    if family == "elasticnet":
-        defaults = {"alpha": 0.001, "l1_ratio": 0.5, "max_iter": 20000}
-        defaults.update(params)
-        return ElasticNet(**defaults)
 
-    if family == "random_forest":
-        defaults = {"n_estimators": 300, "random_state": 42, "n_jobs": 1}
-        defaults.update(params)
-        defaults["random_state"] = 42
-        defaults["n_jobs"] = 1
-        return RandomForestRegressor(**defaults)
+def load_train_spec_from_source(train_source: str):
+    try:
+        ast.parse(train_source, filename=TRAIN_PATH)
+    except SyntaxError as exc:
+        raise InvalidCandidateError(f"train.py is not valid Python: {exc}") from exc
 
-    if family == "extra_trees":
-        defaults = {"n_estimators": 300, "random_state": 42, "n_jobs": 1}
-        defaults.update(params)
-        defaults["random_state"] = 42
-        defaults["n_jobs"] = 1
-        return ExtraTreesRegressor(**defaults)
+    module_name = f"train_runtime_{int(time.time() * 1_000_000)}"
+    module = ModuleType(module_name)
+    module.__file__ = TRAIN_PATH
+    module.__dict__["__name__"] = module_name
+    exec(compile(train_source, TRAIN_PATH, "exec"), module.__dict__)
+    validate_train_module(module)
+    return module
 
-    defaults = {"random_state": 42}
-    defaults.update(params)
-    defaults["random_state"] = 42
-    return GradientBoostingRegressor(**defaults)
+
+def load_train_spec():
+    with open(TRAIN_PATH) as handle:
+        train_source = handle.read()
+    train_sha = sha256_text(train_source)
+    description = extract_description_from_source(train_source)
+    train_spec = load_train_spec_from_source(train_source)
+    return train_spec, train_source, train_sha, description
 
 
 def remaining_budget(start_time: float) -> float:
     return EXPERIMENT_BUDGET_S - (time.monotonic() - start_time)
 
 
-def make_result_entry(
-    *,
-    status: str,
-    description: str,
-    elapsed_s: float,
-    budget_s: int = EXPERIMENT_BUDGET_S,
-    mape=None,
-    cv_mape=None,
-    rmse=None,
-    r2=None,
-    n_features=0,
-    model_class=None,
-    features=None,
-    error=None,
-    artifact_paths=None,
-):
+def build_model_from_spec(train_spec, meta: dict):
+    model = train_spec.build_model(meta)
+    if model is None:
+        raise InvalidCandidateError("build_model(meta) returned None.")
+    return model
+
+
+def fit_model_from_spec(train_spec, model, X_train, y_train, X_val, y_val):
+    fit_model = getattr(train_spec, "fit_model", None)
+    if fit_model is None:
+        fitted_model = model.fit(X_train, y_train)
+    else:
+        fitted_model = fit_model(model, X_train, y_train, X_val, y_val)
+    return fitted_model if fitted_model is not None else model
+
+
+def predict_with_spec(train_spec, model, X: pd.DataFrame) -> np.ndarray:
+    predict_model = getattr(train_spec, "predict_model", None)
+    if predict_model is None:
+        y_pred = model.predict(X)
+    else:
+        y_pred = predict_model(model, X)
+
+    y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
+    if len(y_pred) != len(X):
+        raise InvalidCandidateError(
+            f"predict_model() returned {len(y_pred)} predictions for {len(X)} rows."
+        )
+    return np.clip(y_pred, 0, None)
+
+
+def engineer_numeric_features(train_spec, raw_df: pd.DataFrame, meta: dict) -> pd.DataFrame:
+    feature_df = train_spec.engineer_features(raw_df, meta)
+    if not isinstance(feature_df, pd.DataFrame):
+        raise InvalidCandidateError("engineer_features() must return a pandas DataFrame.")
+
+    numeric_df = feature_df.select_dtypes(include=[np.number]).copy()
+    if numeric_df.empty:
+        raise InvalidCandidateError("engineer_features() returned no numeric features.")
+    return numeric_df
+
+
+def align_feature_frame(feature_df: pd.DataFrame, feature_names: list[str]) -> pd.DataFrame:
+    return feature_df.reindex(columns=feature_names, fill_value=0)
+
+
+def summarize_feature_telemetry(feature_names: list[str], meta: dict) -> dict:
+    base_feature_candidates = list(meta.get("model_features", []))
+    base_feature_set = set(base_feature_candidates)
+    base_feature_names = [name for name in feature_names if name in base_feature_set]
+    derived_feature_names = [name for name in feature_names if name not in base_feature_set]
+    omitted_base_feature_names = [
+        name for name in base_feature_candidates if name not in set(base_feature_names)
+    ]
     return {
-        "status": status,
-        "budget_s": budget_s,
-        "mape": round(float(mape), 4) if mape is not None else None,
-        "cv_mape": round(float(cv_mape), 4) if cv_mape is not None else None,
-        "rmse": round(float(rmse), 4) if rmse is not None else None,
-        "r2": round(float(r2), 4) if r2 is not None else None,
-        "elapsed_s": round(float(elapsed_s), 1),
-        "n_features": int(n_features),
-        "model_class": model_class,
-        "description": description,
-        "is_best": False,
-        "features": features or [],
-        "error": error,
-        "artifact_paths": artifact_paths or {},
+        "base_feature_names": base_feature_names,
+        "derived_feature_names": derived_feature_names,
+        "n_base_features": len(base_feature_names),
+        "n_derived_features": len(derived_feature_names),
+        "n_candidate_base_features": len(base_feature_candidates),
+        "omitted_base_feature_names": omitted_base_feature_names,
     }
 
 
-def best_completed_result(results: list):
-    completed = [
-        r for r in results
-        if r.get("status", STATUS_OK) == STATUS_OK and r.get("mape") is not None
-    ]
-    if not completed:
+def extract_model_params(model) -> Optional[dict]:
+    get_params = getattr(model, "get_params", None)
+    if not callable(get_params):
         return None
-    return min(completed, key=lambda r: r["mape"])
-
-
-def best_completed_mape(results: list):
-    best = best_completed_result(results)
-    return best["mape"] if best else float("inf")
-
-
-def save_result(entry: dict):
-    results = load_results()
-    clean_entry = dict(entry)
-    clean_entry["timestamp"] = datetime.now().isoformat(timespec="seconds")
-    clean_entry["exp_id"] = len(results)
-    clean_entry.pop("artifact_paths", None)
-    results.append(clean_entry)
-
-    os.makedirs("experiments", exist_ok=True)
-    with open(RESULTS_PATH, "w") as f:
-        json.dump(results, f, indent=2)
-    pd.DataFrame(results).to_csv(RESULTS_CSV_PATH, index=False)
-    print(f"\n  Logged as experiment #{clean_entry['exp_id']} → {RESULTS_PATH}")
-    return clean_entry
-
-
-def persist_best_artifacts(entry: dict, train_source: str):
-    artifact_paths = entry.get("artifact_paths", {})
-    if not artifact_paths:
-        return
-
-    os.makedirs("models", exist_ok=True)
-    shutil.copyfile(artifact_paths["model"], MODEL_PATH)
-    shutil.copyfile(artifact_paths["features"], FEATURES_PATH)
-    with open(BEST_TRAIN_SPEC_PATH, "w") as f:
-        f.write(train_source)
-
-
-def cleanup_artifacts(entry: dict):
-    for path in entry.get("artifact_paths", {}).values():
-        if path and os.path.exists(path):
-            os.remove(path)
-
-
-def print_run_report(entry: dict):
-    print(f"\n{'─' * 60}")
-    print(f"  {entry['description']}")
-    print(f"{'─' * 60}")
-    print(f"  Status   : {entry['status']}")
-    print(f"  Budget   : {entry.get('budget_s', EXPERIMENT_BUDGET_S)}s")
-    print(f"  Elapsed  : {entry.get('elapsed_s', 0):.1f}s")
-
-    if entry.get("model_class"):
-        print(f"  Model    : {entry['model_class']}")
-
-    if entry["status"] == STATUS_OK:
-        print(f"  Features ({entry['n_features']}): {entry.get('features', [])}")
-        print(f"  Test MAPE: {entry['mape']:.2f}%   ← PRIMARY METRIC")
-        print(f"  Test RMSE: {entry['rmse']:.4f}")
-        print(f"  Test R²  : {entry['r2']:.4f}")
-        if entry.get("is_best"):
-            print("  ✅ NEW BEST — saved to models/best_model.pkl")
-        else:
-            print("  ❌ Not best")
-    else:
-        if entry.get("error"):
-            print(f"  Error    : {entry['error']}")
-    print(f"{'─' * 60}")
-
-
-def print_summary():
-    results = load_results()
-    if not results:
-        print("No experiments run yet. Run: python run_experiment.py")
-        return
-
-    df = pd.DataFrame(results)
-    if "status" not in df.columns:
-        df["status"] = STATUS_OK
-    if "budget_s" not in df.columns:
-        df["budget_s"] = EXPERIMENT_BUDGET_S
-    if "mape" not in df.columns:
-        df["mape"] = np.nan
-
-    df["sort_status"] = np.where(df["status"] == STATUS_OK, 0, 1)
-    df["sort_mape"] = df["mape"].fillna(np.inf)
-
-    cols = [
-        c for c in [
-            "exp_id",
-            "status",
-            "budget_s",
-            "mape",
-            "rmse",
-            "r2",
-            "model_class",
-            "n_features",
-            "description",
-        ]
-        if c in df.columns
-    ]
-
-    print(f"\n{'═' * 80}")
-    print("  EXPERIMENT HISTORY — successful runs first, then failures/timeouts")
-    print(f"{'═' * 80}")
-    print(
-        df.sort_values(["sort_status", "sort_mape", "exp_id"])[cols].to_string(index=False)
-    )
-
-    best = best_completed_result(results)
-    if best is None:
-        print("\n  No successful completed experiments yet.")
-    else:
-        print(
-            f"\n  🏆 Best: Exp #{int(best['exp_id'])} | "
-            f"MAPE={best['mape']:.2f}% | {best['description']}"
-        )
-
-
-def show_best():
-    results = load_results()
-    best = best_completed_result(results)
-    if best is None:
-        print("No successful experiments yet.")
-        return
-
-    print(f"\n{'═' * 60}")
-    print(f"  🏆 BEST MODEL — Experiment #{best['exp_id']}")
-    print(f"{'═' * 60}")
-    for key, value in best.items():
-        if key != "features":
-            print(f"  {key:20s}: {value}")
-    print(f"\n  Features: {best.get('features', 'N/A')}")
-    print("\n  Load model:")
-    print("    import joblib")
-    print("    model    = joblib.load('models/best_model.pkl')")
-    print("    features = joblib.load('models/best_features.pkl')")
-    print("    best_train_spec = 'models/best_train.py'")
-
-
-def _fit_and_score_worker(
-    queue,
-    X_train,
-    y_train,
-    X_test,
-    y_test,
-    feature_names,
-    model_config,
-    artifact_dir,
-):
     try:
-        model = build_model(model_config)
-        model.fit(X_train, y_train)
-        y_pred = np.clip(model.predict(X_test), 0, None)
+        params = get_params(deep=False)
+    except TypeError:
+        params = get_params()
+    if not isinstance(params, dict):
+        return None
+    return {str(key): json_safe(value) for key, value in params.items()}
 
-        model_path = os.path.join(artifact_dir, "model.pkl")
-        features_path = os.path.join(artifact_dir, "features.pkl")
-        joblib.dump(model, model_path)
-        joblib.dump(feature_names, features_path)
+
+def build_generalization_telemetry(train_metrics: dict, val_metrics: dict) -> dict:
+    train_mape = train_metrics["train_mape"]
+    val_mape = val_metrics["val_mape"]
+    train_rmse = train_metrics["train_rmse"]
+    val_rmse = val_metrics["val_rmse"]
+    return {
+        "train_val_mape_gap": round(float(val_mape - train_mape), 4),
+        "train_val_rmse_gap": round(float(val_rmse - train_rmse), 4),
+        "train_val_mape_ratio": round(float(val_mape / max(train_mape, 1e-9)), 4),
+    }
+
+
+def prepare_validation_inputs(train_spec, train_df: pd.DataFrame, meta: dict):
+    fit_train_df, val_df = split_train_for_validation(train_df)
+    X_train_raw = fit_train_df.drop(columns=["price_msf"])
+    y_train = fit_train_df["price_msf"].to_numpy()
+    X_val_raw = val_df.drop(columns=["price_msf"])
+    y_val = val_df["price_msf"].to_numpy()
+
+    X_train = engineer_numeric_features(train_spec, X_train_raw, meta)
+    feature_names = list(X_train.columns)
+    X_val = engineer_numeric_features(train_spec, X_val_raw, meta)
+    X_val = align_feature_frame(X_val, feature_names)
+
+    return X_train, y_train, X_val, y_val, feature_names
+
+
+def prepare_full_train_inputs(train_spec, train_df: pd.DataFrame, meta: dict):
+    X_train_raw = train_df.drop(columns=["price_msf"])
+    y_train = train_df["price_msf"].to_numpy()
+    X_train = engineer_numeric_features(train_spec, X_train_raw, meta)
+    feature_names = list(X_train.columns)
+    return X_train, y_train, feature_names
+
+
+def prepare_test_inputs(train_spec, test_df: pd.DataFrame, meta: dict, feature_names: list[str]):
+    X_test_raw = test_df.drop(columns=["price_msf"])
+    y_test = test_df["price_msf"].to_numpy()
+    X_test = engineer_numeric_features(train_spec, X_test_raw, meta)
+    X_test = align_feature_frame(X_test, feature_names)
+    return X_test, y_test
+
+
+def build_metrics(y_true: np.ndarray, y_pred: np.ndarray, prefix: str) -> dict:
+    return {
+        f"{prefix}_mape": round(float(mean_absolute_percentage_error(y_true, y_pred) * 100), 4),
+        f"{prefix}_rmse": round(float(np.sqrt(mean_squared_error(y_true, y_pred))), 4),
+        f"{prefix}_r2": round(float(r2_score(y_true, y_pred)), 4),
+    }
+
+
+def _fit_and_score_worker(queue, train_source, X_train, y_train, X_val, y_val, meta):
+    try:
+        train_spec = load_train_spec_from_source(train_source)
+        model = build_model_from_spec(train_spec, meta)
+        model_params = extract_model_params(model)
+
+        fit_started = time.monotonic()
+        fitted_model = fit_model_from_spec(train_spec, model, X_train, y_train, X_val, y_val)
+        fit_elapsed_s = round(float(time.monotonic() - fit_started), 4)
+        if not hasattr(fitted_model, "predict"):
+            raise InvalidCandidateError("Fitted model must expose predict(X).")
+
+        predict_train_started = time.monotonic()
+        y_train_pred = predict_with_spec(train_spec, fitted_model, X_train)
+        predict_train_elapsed_s = round(float(time.monotonic() - predict_train_started), 4)
+
+        predict_val_started = time.monotonic()
+        y_val_pred = predict_with_spec(train_spec, fitted_model, X_val)
+        predict_val_elapsed_s = round(float(time.monotonic() - predict_val_started), 4)
+
+        train_metrics = build_metrics(y_train, y_train_pred, "train")
+        val_metrics = build_metrics(y_val, y_val_pred, "val")
 
         queue.put(
-            make_result_entry(
-                status=STATUS_OK,
-                description="",
-                elapsed_s=0.0,
-                mape=mean_absolute_percentage_error(y_test, y_pred) * 100,
-                cv_mape=None,
-                rmse=np.sqrt(mean_squared_error(y_test, y_pred)),
-                r2=r2_score(y_test, y_pred),
-                n_features=len(feature_names),
-                model_class=type(model).__name__,
-                features=feature_names,
-                artifact_paths={"model": model_path, "features": features_path},
-            )
+            {
+                "fit_elapsed_s": fit_elapsed_s,
+                "status": STATUS_OK,
+                "model_class": type(fitted_model).__name__,
+                "model_params": model_params,
+                "predict_train_elapsed_s": predict_train_elapsed_s,
+                "predict_val_elapsed_s": predict_val_elapsed_s,
+                **train_metrics,
+                **val_metrics,
+                **build_generalization_telemetry(train_metrics, val_metrics),
+            }
         )
+    except HarnessValidationError as exc:
+        queue.put({"status": exc.status, "error": str(exc)})
     except Exception as exc:
-        queue.put(
-            make_result_entry(
-                status=STATUS_TRAIN_FAILED,
-                description="",
-                elapsed_s=0.0,
-                model_class=model_config.get("family"),
-                error=str(exc),
-                features=feature_names,
-                n_features=len(feature_names),
-            )
-        )
+        queue.put({"status": STATUS_TRAIN_FAILED, "error": str(exc)})
 
 
 def fit_and_score_with_budget(
-    X_train,
-    y_train,
-    X_test,
-    y_test,
-    feature_names: list,
-    model_config: dict,
+    train_source: str,
+    X_train: pd.DataFrame,
+    y_train: np.ndarray,
+    X_val: pd.DataFrame,
+    y_val: np.ndarray,
+    meta: dict,
     start_time: float,
-):
+) -> dict:
     budget_left = remaining_budget(start_time)
     if budget_left <= 0:
-        return make_result_entry(
-            status=STATUS_BUDGET_EXCEEDED,
-            description="",
-            elapsed_s=EXPERIMENT_BUDGET_S,
-            model_class=model_config["family"],
-            error="Budget exhausted before model fitting started.",
-            features=feature_names,
-            n_features=len(feature_names),
-        )
+        return {
+            "status": STATUS_BUDGET_EXCEEDED,
+            "error": "Budget exhausted before model fitting started.",
+        }
 
     ctx = mp.get_context("spawn")
     queue = ctx.Queue()
+    process = ctx.Process(
+        target=_fit_and_score_worker,
+        args=(queue, train_source, X_train, y_train, X_val, y_val, meta),
+    )
+    process.start()
+    process.join(timeout=budget_left)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        process = ctx.Process(
-            target=_fit_and_score_worker,
-            args=(queue, X_train, y_train, X_test, y_test, feature_names, model_config, tmpdir),
-        )
-        process.start()
-        process.join(timeout=budget_left)
-
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=5)
         if process.is_alive():
-            process.terminate()
+            process.kill()
             process.join(timeout=5)
-            if process.is_alive():
-                process.kill()
-                process.join(timeout=5)
-            queue.close()
-            queue.join_thread()
-            return make_result_entry(
-                status=STATUS_BUDGET_EXCEEDED,
-                description="",
-                elapsed_s=EXPERIMENT_BUDGET_S,
-                model_class=model_config["family"],
-                error=f"Experiment exceeded the fixed {EXPERIMENT_BUDGET_S}s budget.",
-                features=feature_names,
-                n_features=len(feature_names),
-            )
+        queue.close()
+        queue.join_thread()
+        return {
+            "status": STATUS_BUDGET_EXCEEDED,
+            "error": f"Experiment exceeded the fixed {EXPERIMENT_BUDGET_S}s budget.",
+        }
 
-        try:
-            result = queue.get(timeout=1)
-        except Empty:
-            queue.close()
-            queue.join_thread()
-            return make_result_entry(
-                status=STATUS_TRAIN_FAILED,
-                description="",
-                elapsed_s=EXPERIMENT_BUDGET_S - max(remaining_budget(start_time), 0),
-                model_class=model_config["family"],
-                error="Training process exited without returning results.",
-                features=feature_names,
-                n_features=len(feature_names),
-            )
+    try:
+        result = queue.get(timeout=1)
+    except Empty:
+        result = {
+            "status": STATUS_TRAIN_FAILED,
+            "error": "Training process exited without returning results.",
+        }
+    finally:
         queue.close()
         queue.join_thread()
 
-        artifact_paths = result.get("artifact_paths", {})
-        copied_artifacts = {}
-        for key, path in artifact_paths.items():
-            if path:
-                fd, copied_path = tempfile.mkstemp(prefix=f"corrugated_{key}_", suffix=".pkl")
-                os.close(fd)
-                shutil.copyfile(path, copied_path)
-                copied_artifacts[key] = copied_path
-        result["artifact_paths"] = copied_artifacts
-        return result
+    return result
 
 
-def run_single_experiment():
-    ensure_research_session()
-
-    with open(TRAIN_PATH) as f:
-        train_source = f.read()
-
-    description = extract_description_from_source(train_source)
-
-    try:
-        train_spec, train_source = load_train_spec()
-    except HarnessValidationError as exc:
-        entry = make_result_entry(
-            status=exc.status,
-            description=description,
-            elapsed_s=0.0,
-            error=str(exc),
-        )
-        print_run_report(entry)
-        return save_result(entry)
-
-    train_df, test_df, meta = load_prepared_data()
+def run_once() -> tuple[dict, int]:
     start_time = time.monotonic()
 
     try:
-        X_train_raw = train_df.drop(columns=["price_msf"])
-        y_train = train_df["price_msf"].values
-        X_test_raw = test_df.drop(columns=["price_msf"])
-        y_test = test_df["price_msf"].values
+        train_spec, train_source, train_sha, description = load_train_spec()
+        fingerprints = ensure_prepared_data_baseline()
+        train_df, _test_df, meta = load_prepared_data()
 
-        X_train = train_spec.engineer_features(X_train_raw, meta)
-        X_test = train_spec.engineer_features(X_test_raw, meta)
-
-        X_train = X_train.select_dtypes(include=[np.number])
-        X_test = X_test.select_dtypes(include=[np.number])
-        X_test = X_test.reindex(columns=X_train.columns, fill_value=0)
-
-        feature_names = list(X_train.columns)
-        if not feature_names:
-            raise InvalidCandidateError("engineer_features() returned no numeric features.")
-
-        model_config = normalize_model_config(train_spec.get_model_config())
-    except HarnessValidationError as exc:
-        entry = make_result_entry(
-            status=exc.status,
-            description=description,
-            elapsed_s=EXPERIMENT_BUDGET_S - max(remaining_budget(start_time), 0),
-            error=str(exc),
+        X_train, y_train, X_val, y_val, feature_names = prepare_validation_inputs(
+            train_spec, train_df, meta
         )
-        print_run_report(entry)
-        return save_result(entry)
+        feature_telemetry = summarize_feature_telemetry(feature_names, meta)
+        build_model_from_spec(train_spec, meta)
+
+        worker_result = fit_and_score_with_budget(
+            train_source,
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            meta,
+            start_time,
+        )
+
+        summary = {
+            "budget_s": EXPERIMENT_BUDGET_S,
+            "elapsed_s": round(float(time.monotonic() - start_time), 1),
+            "experiment_description": description,
+            "feature_names": feature_names,
+            "n_features": len(feature_names),
+            "n_train_rows": int(len(X_train)),
+            "n_val_rows": int(len(X_val)),
+            "session_baseline_path": SESSION_BASELINE_PATH,
+            "status": worker_result["status"],
+            "train_sha": train_sha,
+            "validation_random_state": VALIDATION_RANDOM_STATE,
+            "validation_split_size": VALIDATION_SPLIT_SIZE,
+            **fingerprints,
+            **feature_telemetry,
+        }
+        summary["meta_version"] = meta.get("version")
+        summary["elapsed_budget_fraction"] = round(
+            float(summary["elapsed_s"] / EXPERIMENT_BUDGET_S), 4
+        )
+
+        if worker_result["status"] == STATUS_OK:
+            summary["model_class"] = worker_result["model_class"]
+            summary["model_params"] = worker_result["model_params"]
+            summary["fit_elapsed_s"] = worker_result["fit_elapsed_s"]
+            summary["predict_train_elapsed_s"] = worker_result["predict_train_elapsed_s"]
+            summary["predict_val_elapsed_s"] = worker_result["predict_val_elapsed_s"]
+            summary["train_mape"] = worker_result["train_mape"]
+            summary["train_rmse"] = worker_result["train_rmse"]
+            summary["train_r2"] = worker_result["train_r2"]
+            summary["val_mape"] = worker_result["val_mape"]
+            summary["val_rmse"] = worker_result["val_rmse"]
+            summary["val_r2"] = worker_result["val_r2"]
+            summary["train_val_mape_gap"] = worker_result["train_val_mape_gap"]
+            summary["train_val_rmse_gap"] = worker_result["train_val_rmse_gap"]
+            summary["train_val_mape_ratio"] = worker_result["train_val_mape_ratio"]
+            return summary, 0
+
+        summary["error"] = worker_result.get("error")
+        return summary, 1
     except Exception as exc:
-        entry = make_result_entry(
-            status=STATUS_TRAIN_FAILED,
-            description=description,
-            elapsed_s=EXPERIMENT_BUDGET_S - max(remaining_budget(start_time), 0),
-            error=str(exc),
-        )
-        print_run_report(entry)
-        return save_result(entry)
-
-    worker_result = fit_and_score_with_budget(
-        X_train,
-        y_train,
-        X_test,
-        y_test,
-        feature_names,
-        model_config,
-        start_time,
-    )
-    worker_result["description"] = description
-    worker_result["elapsed_s"] = EXPERIMENT_BUDGET_S - max(remaining_budget(start_time), 0)
-
-    previous_results = load_results()
-    previous_best = best_completed_mape(previous_results)
-    if worker_result["status"] == STATUS_OK and worker_result["mape"] < previous_best:
-        worker_result["is_best"] = True
-        persist_best_artifacts(worker_result, train_source)
-
-    print_run_report(worker_result)
-    saved = save_result(worker_result)
-    cleanup_artifacts(worker_result)
-    return saved
+        failure = {
+            "budget_s": EXPERIMENT_BUDGET_S,
+            "elapsed_s": round(float(time.monotonic() - start_time), 1),
+            "experiment_description": extract_description_from_source(
+                Path(TRAIN_PATH).read_text() if os.path.exists(TRAIN_PATH) else ""
+            ),
+            "status": getattr(exc, "status", STATUS_TRAIN_FAILED),
+            "error": str(exc),
+        }
+        if os.path.exists(TRAIN_PATH):
+            failure["train_sha"] = sha256_file(TRAIN_PATH)
+        if all(os.path.exists(path) for path in [TRAIN_DATA_PATH, TEST_DATA_PATH, META_PATH]):
+            failure.update(prepared_data_fingerprints())
+        failure["session_baseline_path"] = SESSION_BASELINE_PATH
+        return failure, 1
 
 
-def run_single_from_train_entrypoint():
-    try:
-        run_single_experiment()
-    except RuntimeError as exc:
-        sys.exit(f"[runner] ERROR: {exc}")
-    print_summary()
-
-
-def build_candidate_commit_message(results: list, train_code: str) -> str:
-    exp_num = len(results)
-    desc = extract_description_from_source(train_code)
-    desc = " ".join(desc.split())
-    if len(desc) > 60:
-        desc = desc[:57] + "..."
-    return f"autoresearch: exp {exp_num} {desc}"
-
-
-def commit_candidate(train_code: str, results: list) -> Optional[str]:
-    with open(TRAIN_PATH, "w") as f:
-        f.write(train_code)
-
-    if not train_file_dirty():
-        return None
-
-    git(["add", "--", TRAIN_PATH])
-    git(["commit", "-m", build_candidate_commit_message(results, train_code), "--", TRAIN_PATH])
-    return current_head()
-
-
-def discard_candidate_commit():
-    git(["reset", "--soft", "HEAD~1"])
-    git(["restore", "--source=HEAD", "--staged", "--worktree", "--", TRAIN_PATH])
-
-
-def get_agent_suggestion(results: list, train_code: str, program_md: str, meta: dict) -> str:
-    history_str = json.dumps(results[-10:], indent=2)
-    meta_str = json.dumps(meta, indent=2)
-    model = resolve_model(None, "AUTORESEARCH_LLM_MODEL", DEFAULT_AGENT_MODEL)
-
-    prompt = f"""You are an ML research agent improving a price prediction model.
-
-Your instructions are in program.md:
-<program_md>
-{program_md}
-</program_md>
-
-Frozen prepared-data metadata:
-<columns_json>
-{meta_str}
-</columns_json>
-
-Current mutable train.py:
-<train_py>
-{train_code}
-</train_py>
-
-Experiment history (last 10 runs):
-<history>
-{history_str}
-</history>
-
-Return the COMPLETE updated train.py.
-
-Hard constraints:
-- You may only change EXPERIMENT_DESCRIPTION, engineer_features(), and get_model_config()
-- Do not add imports, helpers, globals, or any new top-level code
-- get_model_config() must return a dict with:
-  - family: one of {sorted(SUPPORTED_MODEL_FAMILIES)}
-  - params: dict
-- Optimize for lower test MAPE under a fixed {EXPERIMENT_BUDGET_S}s experiment budget
-- Return ONLY raw Python source, with no markdown fences or extra prose
-"""
-
-    return chat_completion_text(
-        task_label="runner",
-        system_prompt=None,
-        user_prompt=prompt,
-        model=model,
-        max_tokens=4096,
-    )
-
-
-def autonomous_loop(n: int):
-    print(f"\n[runner] Starting autonomous loop: {n} experiments")
-    ensure_git_ready()
+def accept_once(expected_train_sha: str, output_dir: Optional[str] = None) -> tuple[dict, int]:
+    start_time = time.monotonic()
+    output_path: Optional[Path] = None
 
     try:
-        ensure_research_session()
-    except RuntimeError as exc:
-        print(f"[runner] ERROR: {exc}")
-        return
-    with open(PROGRAM_MD) as f:
-        program_md = f.read()
-    with open(META_PATH) as f:
-        meta = json.load(f)
-
-    for i in range(n):
-        print(f"\n{'═' * 60}")
-        print(f"  LOOP {i + 1}/{n}")
-        print(f"{'═' * 60}")
-
-        print("[runner] Asking agent for next hypothesis...")
-        with open(TRAIN_PATH) as f:
-            train_code = f.read()
-
-        results = load_results()
-        new_train = get_agent_suggestion(results, train_code, program_md, meta)
-
-        if not new_train.strip():
-            rejected = make_result_entry(
-                status=STATUS_INVALID_CANDIDATE,
-                description="empty agent response",
-                elapsed_s=0.0,
-                error="Agent returned an empty train.py candidate.",
+        train_spec, _train_source, train_sha, description = load_train_spec()
+        if train_sha != expected_train_sha:
+            raise HashMismatchError(
+                f"Current train.py hash {train_sha} does not match expected {expected_train_sha}."
             )
-            print_run_report(rejected)
-            save_result(rejected)
-            break
 
-        if new_train.startswith("```"):
-            lines = new_train.splitlines()
-            new_train = "\n".join(lines[1:-1])
+        fingerprints = ensure_prepared_data_baseline()
+        train_df, test_df, meta = load_prepared_data()
 
-        try:
-            validate_train_source(new_train)
-        except HarnessValidationError as exc:
-            rejected = make_result_entry(
-                status=exc.status,
-                description=extract_description_from_source(new_train),
-                elapsed_s=0.0,
-                error=str(exc),
+        X_train, y_train, feature_names = prepare_full_train_inputs(train_spec, train_df, meta)
+        X_test, y_test = prepare_test_inputs(train_spec, test_df, meta, feature_names)
+        feature_telemetry = summarize_feature_telemetry(feature_names, meta)
+
+        model = build_model_from_spec(train_spec, meta)
+        model_params = extract_model_params(model)
+        fit_started = time.monotonic()
+        fitted_model = fit_model_from_spec(train_spec, model, X_train, y_train, X_train, y_train)
+        fit_elapsed_s = round(float(time.monotonic() - fit_started), 4)
+        if not hasattr(fitted_model, "predict"):
+            raise InvalidCandidateError("Fitted model must expose predict(X).")
+
+        predict_test_started = time.monotonic()
+        y_test_pred = predict_with_spec(train_spec, fitted_model, X_test)
+        predict_test_elapsed_s = round(float(time.monotonic() - predict_test_started), 4)
+        test_metrics = build_metrics(y_test, y_test_pred, "test")
+
+        resolved_output_dir = output_dir or make_output_dir(train_sha)
+        output_path = Path(resolved_output_dir)
+        if output_path.exists():
+            raise RuntimeError(
+                f"Artifact directory already exists: {resolved_output_dir}. Choose a new --output-dir."
             )
-            print_run_report(rejected)
-            save_result(rejected)
-            print("[runner] Agent suggestion rejected before commit.")
-            break
 
-        best_mape_before = best_completed_mape(results)
+        output_path.mkdir(parents=True, exist_ok=False)
 
-        try:
-            commit_hash = commit_candidate(new_train, results)
-        except RuntimeError as exc:
-            print(f"[runner] ERROR: failed to create candidate git commit: {exc}")
-            break
+        model_path = output_path / "model.pkl"
+        features_path = output_path / "feature_columns.json"
+        train_copy_path = output_path / "train.py"
+        manifest_path = output_path / "manifest.json"
 
-        if commit_hash is None:
-            rejected = make_result_entry(
-                status=STATUS_INVALID_CANDIDATE,
-                description=extract_description_from_source(new_train),
-                elapsed_s=0.0,
-                error="Agent candidate did not change train.py.",
-            )
-            print_run_report(rejected)
-            save_result(rejected)
-            print("[runner] Agent produced no train.py change — stopping loop")
-            break
+        joblib.dump(fitted_model, model_path)
+        with open(features_path, "w") as handle:
+            json.dump(feature_names, handle, indent=2)
+        shutil.copyfile(TRAIN_PATH, train_copy_path)
 
-        print(f"[runner] Candidate committed as {commit_hash}")
+        manifest = {
+            "artifact_paths": {
+                "feature_columns": str(features_path),
+                "manifest": str(manifest_path),
+                "model": str(model_path),
+                "train_py": str(train_copy_path),
+            },
+            "elapsed_s": round(float(time.monotonic() - start_time), 1),
+            "experiment_description": description,
+            "feature_names": feature_names,
+            "fit_elapsed_s": fit_elapsed_s,
+            "meta_version": meta.get("version"),
+            "model_class": type(fitted_model).__name__,
+            "model_params": model_params,
+            "n_features": len(feature_names),
+            "n_test_rows": int(len(X_test)),
+            "n_train_rows": int(len(X_train)),
+            "output_dir": str(output_path),
+            "predict_test_elapsed_s": predict_test_elapsed_s,
+            "saved_at": current_timestamp(),
+            "session_baseline_path": SESSION_BASELINE_PATH,
+            "status": STATUS_OK,
+            "train_sha": train_sha,
+            **fingerprints,
+            **feature_telemetry,
+            **test_metrics,
+        }
 
-        time.sleep(1)
+        with open(manifest_path, "w") as handle:
+            json.dump(manifest, handle, indent=2, sort_keys=True)
 
-        try:
-            entry = run_single_experiment()
-        except RuntimeError as exc:
-            print(f"[runner] ERROR: {exc}")
-            break
-
-        improved = (
-            entry.get("status") == STATUS_OK
-            and entry.get("mape") is not None
-            and entry["mape"] < best_mape_before
-        )
-
-        if improved:
-            print(
-                "[runner] Candidate improved MAPE "
-                f"({entry['mape']:.2f}% < {best_mape_before:.2f}%)"
-            )
-            print(f"[runner] Keeping git commit {commit_hash}")
-        else:
-            reason = entry.get("status", STATUS_TRAIN_FAILED)
-            print(f"[runner] Candidate rejected with status `{reason}`")
-            try:
-                discard_candidate_commit()
-                print(f"[runner] Discarded git commit {commit_hash}")
-                print(f"[runner] Reset train.py to accepted commit {current_head()}")
-            except RuntimeError as exc:
-                print(f"[runner] ERROR: failed to discard candidate cleanly: {exc}")
-                break
-
-        if i == n - 1:
-            print("[runner] Final experiment complete.")
-
-    print_summary()
+        return manifest, 0
+    except Exception as exc:
+        if output_path is not None and output_path.exists():
+            shutil.rmtree(output_path, ignore_errors=True)
+        failure = {
+            "elapsed_s": round(float(time.monotonic() - start_time), 1),
+            "experiment_description": extract_description_from_source(
+                Path(TRAIN_PATH).read_text() if os.path.exists(TRAIN_PATH) else ""
+            ),
+            "status": getattr(exc, "status", STATUS_TRAIN_FAILED),
+            "error": str(exc),
+            "expected_train_sha": expected_train_sha,
+        }
+        if os.path.exists(TRAIN_PATH):
+            failure["train_sha"] = sha256_file(TRAIN_PATH)
+        if all(os.path.exists(path) for path in [TRAIN_DATA_PATH, TEST_DATA_PATH, META_PATH]):
+            failure.update(prepared_data_fingerprints())
+        failure["session_baseline_path"] = SESSION_BASELINE_PATH
+        return failure, 1
 
 
-def manual_loop(n: int):
-    print(f"\n[runner] Manual loop: running the immutable harness {n} time(s)")
-    for i in range(n):
-        print(f"\n{'─' * 40}  Run {i + 1}/{n}  {'─' * 40}")
-        try:
-            run_single_experiment()
-        except RuntimeError as exc:
-            print(f"[runner] ERROR: {exc}")
-            break
-        time.sleep(0.2)
-    print_summary()
+def run_single_from_train_entrypoint() -> None:
+    summary, exit_code = run_once()
+    print_json(summary)
+    if exit_code != 0:
+        sys.exit(exit_code)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Deterministic AutoResearch runner")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("run", help="Run validation-only evaluation for the current train.py")
+
+    accept_parser = subparsers.add_parser(
+        "accept",
+        help="Retrain the accepted train.py on all train data and save artifact bundle",
+    )
+    accept_parser.add_argument(
+        "--expected-train-sha",
+        required=True,
+        help="train_sha reported by `python run_experiment.py run`.",
+    )
+    accept_parser.add_argument(
+        "--output-dir",
+        help="Override the default artifact directory (defaults to models/accepted/<train_sha[:12]>).",
+    )
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.command == "run":
+        summary, exit_code = run_once()
+    else:
+        summary, exit_code = accept_once(args.expected_train_sha, args.output_dir)
+
+    print_json(summary)
+    return exit_code
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Immutable AutoResearch experiment harness")
-    parser.add_argument("--n", type=int, default=1, help="Number of experiments to run")
-    parser.add_argument(
-        "--auto",
-        action="store_true",
-        help="Enable git-backed autonomous mode (requires OPENAI_API_KEY)",
-    )
-    parser.add_argument("--summary", action="store_true", help="Print experiment history and exit")
-    parser.add_argument("--best", action="store_true", help="Show best model details and exit")
-    args = parser.parse_args()
-
-    os.makedirs("experiments", exist_ok=True)
-
-    if args.summary:
-        print_summary()
-    elif args.best:
-        show_best()
-    elif args.auto:
-        autonomous_loop(args.n)
-    else:
-        manual_loop(args.n)
+    raise SystemExit(main())
