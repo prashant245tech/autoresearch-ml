@@ -19,7 +19,7 @@ from uuid import uuid4
 
 SEARCH_MEMORY_PATH = "experiments/search_memory.jsonl"
 SEARCH_SUMMARY_PATH = "experiments/search_summary.json"
-SUMMARY_FORMAT_VERSION = 2
+SUMMARY_FORMAT_VERSION = 5
 
 EVENT_TYPE_RUN = "run"
 EVENT_TYPE_ACCEPT = "accept"
@@ -29,6 +29,8 @@ SUMMARY_RECENT_EVENTS_LIMIT = 10
 SUMMARY_TOP_CANDIDATES_LIMIT = 10
 
 NON_SEARCH_RELEVANT_STATUSES = {"prepared_data_mismatch", "hash_mismatch"}
+
+DESCRIPTION_UNKNOWN = "unknown"
 
 
 def _json_stable(value) -> str:
@@ -45,6 +47,56 @@ def _timestamp() -> str:
 
 def _ensure_parent_dir(path: str) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+
+def parse_experiment_description(description: Optional[str]) -> dict:
+    parsed = {
+        "move_intent": DESCRIPTION_UNKNOWN,
+        "change_type": DESCRIPTION_UNKNOWN,
+        "declared_family": DESCRIPTION_UNKNOWN,
+        "change_summary": None,
+        "hypothesis": None,
+    }
+    if not description or not isinstance(description, str):
+        return parsed
+
+    fields = {}
+    for raw_part in description.split("|"):
+        part = raw_part.strip()
+        if not part or "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key:
+            fields[key] = value
+
+    parsed["move_intent"] = fields.get("move_intent", DESCRIPTION_UNKNOWN) or DESCRIPTION_UNKNOWN
+    parsed["change_type"] = fields.get("change_type", DESCRIPTION_UNKNOWN) or DESCRIPTION_UNKNOWN
+    parsed["declared_family"] = fields.get("family", DESCRIPTION_UNKNOWN) or DESCRIPTION_UNKNOWN
+    parsed["change_summary"] = fields.get("change")
+    parsed["hypothesis"] = fields.get("hypothesis")
+    return parsed
+
+
+def description_fields_for_event(event: dict) -> dict:
+    parsed = parse_experiment_description(event.get("experiment_description"))
+    move_intent = event.get("move_intent")
+    change_type = event.get("change_type")
+    declared_family = event.get("declared_family")
+    change_summary = event.get("change_summary")
+    hypothesis = event.get("hypothesis")
+    if move_intent:
+        parsed["move_intent"] = move_intent
+    if change_type:
+        parsed["change_type"] = change_type
+    if declared_family:
+        parsed["declared_family"] = declared_family
+    if change_summary:
+        parsed["change_summary"] = change_summary
+    if hypothesis:
+        parsed["hypothesis"] = hypothesis
+    return parsed
 
 
 def build_model_signature(model_class: Optional[str], model_params: Optional[dict]) -> Optional[str]:
@@ -88,6 +140,7 @@ def is_search_relevant_event(event_type: str, status: Optional[str]) -> bool:
 
 
 def _simplified_recent_event(event: dict) -> dict:
+    description_fields = description_fields_for_event(event)
     payload = {
         "event_id": event.get("event_id"),
         "event_type": event.get("event_type"),
@@ -97,10 +150,15 @@ def _simplified_recent_event(event: dict) -> dict:
         "candidate_signature": event.get("candidate_signature"),
         "model_class": event.get("model_class"),
         "experiment_description": event.get("experiment_description"),
+        "move_intent": description_fields["move_intent"],
+        "change_type": description_fields["change_type"],
+        "declared_family": description_fields["declared_family"],
     }
     if event.get("event_type") == EVENT_TYPE_RUN:
         payload["val_mape"] = event.get("val_mape")
         payload["train_mape"] = event.get("train_mape")
+        payload["feature_importance_source"] = event.get("feature_importance_source")
+        payload["top_feature_importances"] = event.get("top_feature_importances")
     if event.get("event_type") == EVENT_TYPE_ACCEPT:
         payload["test_mape"] = event.get("test_mape")
         payload["output_dir"] = event.get("output_dir")
@@ -131,6 +189,8 @@ def _build_empty_summary(prepared_data_sha: Optional[str]) -> dict:
         "duplicate_candidate_counts": {},
         "accepted_candidates": [],
         "repeated_exact_runs": [],
+        "move_intent_distribution": {},
+        "family_branch_depth": None,
     }
 
 
@@ -149,6 +209,7 @@ def build_event(event_type: str, payload: dict) -> Optional[dict]:
         model_signature,
         feature_signature,
     )
+    parsed_description = parse_experiment_description(payload.get("experiment_description"))
 
     event = {
         "event_id": uuid4().hex,
@@ -161,6 +222,7 @@ def build_event(event_type: str, payload: dict) -> Optional[dict]:
         "model_signature": model_signature,
         "feature_signature": feature_signature,
         "candidate_signature": candidate_signature,
+        **parsed_description,
     }
 
     if payload.get("error"):
@@ -173,6 +235,8 @@ def build_event(event_type: str, payload: dict) -> Optional[dict]:
             "elapsed_budget_fraction",
             "model_class",
             "model_params",
+            "feature_importance_source",
+            "top_feature_importances",
             "feature_names",
             "n_features",
             "n_train_rows",
@@ -264,6 +328,7 @@ def _resolve_scope_prepared_data_sha(
 
 
 def _best_run_payload(event: dict) -> dict:
+    description_fields = description_fields_for_event(event)
     return {
         "candidate_signature": event.get("candidate_signature"),
         "feature_signature": event.get("feature_signature"),
@@ -271,6 +336,11 @@ def _best_run_payload(event: dict) -> dict:
         "train_sha": event.get("train_sha"),
         "model_class": event.get("model_class"),
         "experiment_description": event.get("experiment_description"),
+        "move_intent": description_fields["move_intent"],
+        "change_type": description_fields["change_type"],
+        "declared_family": description_fields["declared_family"],
+        "feature_importance_source": event.get("feature_importance_source"),
+        "top_feature_importances": event.get("top_feature_importances"),
         "val_mape": event.get("val_mape"),
         "val_rmse": event.get("val_rmse"),
         "val_r2": event.get("val_r2"),
@@ -279,6 +349,63 @@ def _best_run_payload(event: dict) -> dict:
         "n_base_features": event.get("n_base_features"),
         "n_derived_features": event.get("n_derived_features"),
         "recorded_at": event.get("recorded_at"),
+    }
+
+
+def _select_best_attempt(events: list[dict], metric_key: str) -> dict:
+    best_metric = min(event.get(metric_key, float("inf")) for event in events)
+    best_events = [
+        event
+        for event in events
+        if event.get(metric_key, float("inf")) == best_metric
+    ]
+    return max(best_events, key=lambda event: event.get("recorded_at") or "")
+
+
+def _build_move_intent_distribution(run_events: list[dict]) -> dict:
+    counts = {}
+    for event in run_events:
+        move_intent = description_fields_for_event(event)["move_intent"]
+        counts[move_intent] = counts.get(move_intent, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _build_family_branch_depth(successful_runs: list[dict]) -> Optional[dict]:
+    if not successful_runs:
+        return None
+
+    ordered_runs = sorted(successful_runs, key=lambda event: event.get("recorded_at") or "")
+    latest = ordered_runs[-1]
+    current_model_class = latest.get("model_class")
+    if not current_model_class:
+        return None
+    latest_description_fields = description_fields_for_event(latest)
+
+    depth = 0
+    branch_start_recorded_at = latest.get("recorded_at")
+    branch_start_train_sha = latest.get("train_sha")
+    branch_move_intents = []
+
+    for event in reversed(ordered_runs):
+        if event.get("model_class") != current_model_class:
+            break
+        description_fields = description_fields_for_event(event)
+        depth += 1
+        branch_start_recorded_at = event.get("recorded_at")
+        branch_start_train_sha = event.get("train_sha")
+        branch_move_intents.append(description_fields["move_intent"])
+        if description_fields["move_intent"] == "explore_new_branch":
+            break
+
+    branch_move_intents.reverse()
+    return {
+        "model_class": current_model_class,
+        "declared_family": latest_description_fields["declared_family"],
+        "depth": depth,
+        "latest_move_intent": latest_description_fields["move_intent"],
+        "branch_start_recorded_at": branch_start_recorded_at,
+        "branch_start_train_sha": branch_start_train_sha,
+        "branch_move_intents": branch_move_intents,
     }
 
 
@@ -308,12 +435,11 @@ def build_summary(
         "accepts": len(successful_accepts),
         "failed_accepts": len(failed_accepts),
     }
+    summary["move_intent_distribution"] = _build_move_intent_distribution(run_events)
+    summary["family_branch_depth"] = _build_family_branch_depth(successful_runs)
 
     if successful_runs:
-        best_run = min(
-            successful_runs,
-            key=lambda event: (event.get("val_mape", float("inf")), event.get("recorded_at", "")),
-        )
+        best_run = _select_best_attempt(successful_runs, "val_mape")
         summary["best_run"] = _best_run_payload(best_run)
 
     candidate_groups = {}
@@ -353,10 +479,8 @@ def build_summary(
 
     top_unique_candidates = []
     for candidate_signature, attempts in candidate_groups.items():
-        best_attempt = min(
-            attempts,
-            key=lambda event: (event.get("val_mape", float("inf")), event.get("recorded_at", "")),
-        )
+        best_attempt = _select_best_attempt(attempts, "val_mape")
+        description_fields = description_fields_for_event(best_attempt)
         accept_count = sum(
             1
             for event in successful_accepts
@@ -370,6 +494,11 @@ def build_summary(
                 "train_sha": best_attempt.get("train_sha"),
                 "model_class": best_attempt.get("model_class"),
                 "experiment_description": best_attempt.get("experiment_description"),
+                "move_intent": description_fields["move_intent"],
+                "change_type": description_fields["change_type"],
+                "declared_family": description_fields["declared_family"],
+                "feature_importance_source": best_attempt.get("feature_importance_source"),
+                "top_feature_importances": best_attempt.get("top_feature_importances"),
                 "best_val_mape": best_attempt.get("val_mape"),
                 "best_val_rmse": best_attempt.get("val_rmse"),
                 "best_val_r2": best_attempt.get("val_r2"),
@@ -428,6 +557,7 @@ def build_summary(
 
     accepted_candidates = {}
     for event in successful_accepts:
+        description_fields = description_fields_for_event(event)
         candidate_signature = event.get("candidate_signature")
         key = candidate_signature or event.get("event_id")
         existing = accepted_candidates.get(key)
@@ -437,6 +567,9 @@ def build_summary(
             "train_sha": event.get("train_sha"),
             "model_class": event.get("model_class"),
             "experiment_description": event.get("experiment_description"),
+            "move_intent": description_fields["move_intent"],
+            "change_type": description_fields["change_type"],
+            "declared_family": description_fields["declared_family"],
             "test_mape": event.get("test_mape"),
             "test_rmse": event.get("test_rmse"),
             "test_r2": event.get("test_r2"),

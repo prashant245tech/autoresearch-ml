@@ -39,6 +39,8 @@ from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error, 
 from sklearn.model_selection import train_test_split
 
 TRAIN_PATH = "train.py"
+BASELINES_DIR = "baselines"
+DEFAULT_BASELINE_TRAIN_PATH = os.path.join(BASELINES_DIR, "train.generic.py")
 META_PATH = "data/columns.json"
 TRAIN_DATA_PATH = "data/train.parquet"
 TEST_DATA_PATH = "data/test.parquet"
@@ -54,6 +56,7 @@ STATUS_INVALID_CANDIDATE = "invalid_candidate"
 STATUS_TRAIN_FAILED = "train_failed"
 STATUS_HASH_MISMATCH = "hash_mismatch"
 STATUS_PREPARED_DATA_MISMATCH = "prepared_data_mismatch"
+STATUS_INIT_FAILED = "init_failed"
 
 
 class HarnessValidationError(Exception):
@@ -135,6 +138,25 @@ def load_prepared_data() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     with open(META_PATH) as handle:
         meta = json.load(handle)
     return train_df, test_df, meta
+
+
+def resolve_target_column(meta: dict) -> str:
+    target_column = meta.get("target")
+    if not isinstance(target_column, str) or not target_column.strip():
+        raise InvalidCandidateError(
+            f"Prepared metadata in {META_PATH} must define a non-empty `target` field."
+        )
+    return target_column
+
+
+def split_features_and_target(df: pd.DataFrame, target_column: str) -> tuple[pd.DataFrame, np.ndarray]:
+    if target_column not in df.columns:
+        raise InvalidCandidateError(
+            f"Prepared dataset is missing target column `{target_column}`."
+        )
+    X = df.drop(columns=[target_column])
+    y = df[target_column].to_numpy()
+    return X, y
 
 
 def prepared_data_fingerprints() -> dict:
@@ -274,6 +296,11 @@ def load_train_spec_from_source(train_source: str):
 
 
 def load_train_spec():
+    if not os.path.exists(TRAIN_PATH):
+        raise InvalidCandidateError(
+            f"{TRAIN_PATH} not found. Run `python run_experiment.py init-train` "
+            f"to create it from {DEFAULT_BASELINE_TRAIN_PATH}."
+        )
     with open(TRAIN_PATH) as handle:
         train_source = handle.read()
     train_sha = sha256_text(train_source)
@@ -363,6 +390,31 @@ def extract_model_params(model) -> Optional[dict]:
     return {str(key): json_safe(value) for key, value in params.items()}
 
 
+def extract_top_feature_importances(
+    model,
+    feature_names: list[str],
+    limit: int = 15,
+) -> tuple[Optional[str], Optional[dict]]:
+    raw_importances = getattr(model, "feature_importances_", None)
+    if raw_importances is None:
+        return None, None
+
+    importances = np.asarray(raw_importances, dtype=float).reshape(-1)
+    if len(importances) != len(feature_names):
+        return None, None
+
+    ranked_pairs = sorted(
+        zip(feature_names, importances),
+        key=lambda item: (-float(item[1]), item[0]),
+    )
+    top_pairs = ranked_pairs[:limit]
+    top_feature_importances = {
+        feature_name: round(float(score), 6)
+        for feature_name, score in top_pairs
+    }
+    return "feature_importances_", top_feature_importances
+
+
 def build_generalization_telemetry(train_metrics: dict, val_metrics: dict) -> dict:
     train_mape = train_metrics["train_mape"]
     val_mape = val_metrics["val_mape"]
@@ -377,10 +429,9 @@ def build_generalization_telemetry(train_metrics: dict, val_metrics: dict) -> di
 
 def prepare_validation_inputs(train_spec, train_df: pd.DataFrame, meta: dict):
     fit_train_df, val_df = split_train_for_validation(train_df)
-    X_train_raw = fit_train_df.drop(columns=["price_msf"])
-    y_train = fit_train_df["price_msf"].to_numpy()
-    X_val_raw = val_df.drop(columns=["price_msf"])
-    y_val = val_df["price_msf"].to_numpy()
+    target_column = resolve_target_column(meta)
+    X_train_raw, y_train = split_features_and_target(fit_train_df, target_column)
+    X_val_raw, y_val = split_features_and_target(val_df, target_column)
 
     X_train = engineer_numeric_features(train_spec, X_train_raw, meta)
     feature_names = list(X_train.columns)
@@ -391,16 +442,16 @@ def prepare_validation_inputs(train_spec, train_df: pd.DataFrame, meta: dict):
 
 
 def prepare_full_train_inputs(train_spec, train_df: pd.DataFrame, meta: dict):
-    X_train_raw = train_df.drop(columns=["price_msf"])
-    y_train = train_df["price_msf"].to_numpy()
+    target_column = resolve_target_column(meta)
+    X_train_raw, y_train = split_features_and_target(train_df, target_column)
     X_train = engineer_numeric_features(train_spec, X_train_raw, meta)
     feature_names = list(X_train.columns)
     return X_train, y_train, feature_names
 
 
 def prepare_test_inputs(train_spec, test_df: pd.DataFrame, meta: dict, feature_names: list[str]):
-    X_test_raw = test_df.drop(columns=["price_msf"])
-    y_test = test_df["price_msf"].to_numpy()
+    target_column = resolve_target_column(meta)
+    X_test_raw, y_test = split_features_and_target(test_df, target_column)
     X_test = engineer_numeric_features(train_spec, X_test_raw, meta)
     X_test = align_feature_frame(X_test, feature_names)
     return X_test, y_test
@@ -425,6 +476,10 @@ def _fit_and_score_worker(queue, train_source, X_train, y_train, X_val, y_val, m
         fit_elapsed_s = round(float(time.monotonic() - fit_started), 4)
         if not hasattr(fitted_model, "predict"):
             raise InvalidCandidateError("Fitted model must expose predict(X).")
+        feature_importance_source, top_feature_importances = extract_top_feature_importances(
+            fitted_model,
+            list(X_train.columns),
+        )
 
         predict_train_started = time.monotonic()
         y_train_pred = predict_with_spec(train_spec, fitted_model, X_train)
@@ -437,19 +492,22 @@ def _fit_and_score_worker(queue, train_source, X_train, y_train, X_val, y_val, m
         train_metrics = build_metrics(y_train, y_train_pred, "train")
         val_metrics = build_metrics(y_val, y_val_pred, "val")
 
-        queue.put(
-            {
-                "fit_elapsed_s": fit_elapsed_s,
-                "status": STATUS_OK,
-                "model_class": type(fitted_model).__name__,
-                "model_params": model_params,
-                "predict_train_elapsed_s": predict_train_elapsed_s,
-                "predict_val_elapsed_s": predict_val_elapsed_s,
-                **train_metrics,
-                **val_metrics,
-                **build_generalization_telemetry(train_metrics, val_metrics),
-            }
-        )
+        result = {
+            "fit_elapsed_s": fit_elapsed_s,
+            "status": STATUS_OK,
+            "model_class": type(fitted_model).__name__,
+            "model_params": model_params,
+            "predict_train_elapsed_s": predict_train_elapsed_s,
+            "predict_val_elapsed_s": predict_val_elapsed_s,
+            **train_metrics,
+            **val_metrics,
+            **build_generalization_telemetry(train_metrics, val_metrics),
+        }
+        if feature_importance_source and top_feature_importances is not None:
+            result["feature_importance_source"] = feature_importance_source
+            result["top_feature_importances"] = top_feature_importances
+
+        queue.put(result)
     except HarnessValidationError as exc:
         queue.put({"status": exc.status, "error": str(exc)})
     except Exception as exc:
@@ -560,6 +618,10 @@ def run_once() -> tuple[dict, int]:
         if worker_result["status"] == STATUS_OK:
             summary["model_class"] = worker_result["model_class"]
             summary["model_params"] = worker_result["model_params"]
+            if "feature_importance_source" in worker_result:
+                summary["feature_importance_source"] = worker_result["feature_importance_source"]
+            if "top_feature_importances" in worker_result:
+                summary["top_feature_importances"] = worker_result["top_feature_importances"]
             summary["fit_elapsed_s"] = worker_result["fit_elapsed_s"]
             summary["predict_train_elapsed_s"] = worker_result["predict_train_elapsed_s"]
             summary["predict_val_elapsed_s"] = worker_result["predict_val_elapsed_s"]
@@ -720,6 +782,50 @@ def memory_summary_once() -> tuple[dict, int]:
         )
 
 
+def init_train_once(force: bool = False, baseline_path: Optional[str] = None) -> tuple[dict, int]:
+    source_path = baseline_path or DEFAULT_BASELINE_TRAIN_PATH
+
+    try:
+        if not os.path.exists(source_path):
+            raise RuntimeError(
+                f"Baseline train spec not found: {source_path}."
+            )
+        if os.path.exists(TRAIN_PATH) and not force:
+            raise RuntimeError(
+                f"{TRAIN_PATH} already exists. Re-run with `--force` to replace it."
+            )
+
+        Path(TRAIN_PATH).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_path, TRAIN_PATH)
+        with open(TRAIN_PATH, encoding="utf-8") as handle:
+            train_source = handle.read()
+
+        return (
+            {
+                "status": STATUS_OK,
+                "baseline_path": source_path,
+                "experiment_description": extract_description_from_source(train_source),
+                "message": (
+                    f"Created local {TRAIN_PATH} from {source_path}. "
+                    "Edit train.py and then run `python run_experiment.py run`."
+                ),
+                "train_path": TRAIN_PATH,
+                "train_sha": sha256_text(train_source),
+            },
+            0,
+        )
+    except Exception as exc:
+        return (
+            {
+                "status": STATUS_INIT_FAILED,
+                "baseline_path": source_path,
+                "error": str(exc),
+                "train_path": TRAIN_PATH,
+            },
+            1,
+        )
+
+
 def run_single_from_train_entrypoint() -> None:
     summary, exit_code = run_once()
     print_json(summary)
@@ -730,6 +836,21 @@ def run_single_from_train_entrypoint() -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Deterministic AutoResearch runner")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    init_parser = subparsers.add_parser(
+        "init-train",
+        help="Create a local editable train.py from a tracked baseline",
+    )
+    init_parser.add_argument(
+        "--baseline-path",
+        default=DEFAULT_BASELINE_TRAIN_PATH,
+        help=f"Source baseline to copy into {TRAIN_PATH}.",
+    )
+    init_parser.add_argument(
+        "--force",
+        action="store_true",
+        help=f"Replace an existing {TRAIN_PATH}.",
+    )
 
     subparsers.add_parser("run", help="Run validation-only evaluation for the current train.py")
     subparsers.add_parser(
@@ -758,7 +879,9 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.command == "run":
+    if args.command == "init-train":
+        summary, exit_code = init_train_once(args.force, args.baseline_path)
+    elif args.command == "run":
         summary, exit_code = run_once()
     elif args.command == "memory-summary":
         summary, exit_code = memory_summary_once()

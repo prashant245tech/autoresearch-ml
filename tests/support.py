@@ -8,6 +8,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+DEFAULT_TARGET_COLUMN = "target_value"
+
 
 class WorkspaceTestCase(unittest.TestCase):
     def setUp(self):
@@ -48,7 +50,7 @@ class WorkspaceTestCase(unittest.TestCase):
             train_df = pd.DataFrame(
                 {
                     "x": x_train,
-                    "price_msf": (3.0 * x_train) + 5.0,
+                    DEFAULT_TARGET_COLUMN: (3.0 * x_train) + 5.0,
                 }
             )
         if test_df is None:
@@ -56,12 +58,13 @@ class WorkspaceTestCase(unittest.TestCase):
             test_df = pd.DataFrame(
                 {
                     "x": x_test,
-                    "price_msf": (3.0 * x_test) + 5.0,
+                    DEFAULT_TARGET_COLUMN: (3.0 * x_test) + 5.0,
                 }
             )
         if meta is None:
             meta = {
                 "version": "test-suite",
+                "target": DEFAULT_TARGET_COLUMN,
                 "model_features": ["x"],
                 "ref_cols": [],
                 "encoding": {},

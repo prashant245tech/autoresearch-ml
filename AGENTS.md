@@ -7,10 +7,13 @@ This file is the repo-level guide for coding agents working in this project.
 This repo is a generic, agent-guided ML experimentation framework:
 
 - `prepare.py` freezes the data boundary
-- `train.py` is the editable experiment hypothesis
+- `baselines/train.generic.py` is the tracked neutral bootstrap baseline
+- local `train.py` is the editable experiment hypothesis
 - `run_experiment.py` is the deterministic evaluation and export harness
 - `search_memory.py` stores local run/accept history and summaries
+- `explain.py` provides optional post-hoc SHAP analysis for accepted artifacts
 - `program.md` is the generic external-agent tuning policy
+- `program.md` includes a machine-readable policy-threshold block for search behavior
 
 The design goal is a thin, reliable protocol surface around an editable training spec.
 
@@ -21,7 +24,7 @@ Tracked framework files:
 - `prepare.py`
 - `run_experiment.py`
 - `search_memory.py`
-- `train.py`
+- `baselines/train.generic.py`
 - `program.md`
 - `README.md`
 - `config/feature_spec.schema.json`
@@ -29,6 +32,7 @@ Tracked framework files:
 
 Local untracked task files:
 
+- `train.py`
 - `config/feature_spec.json`
 - `config/task_context.md`
 
@@ -77,32 +81,40 @@ Important:
 Use this flow during model iteration:
 
 1. Read `program.md`.
-2. Read:
+2. If `train.py` does not exist yet, run:
+
+```bash
+python run_experiment.py init-train
+```
+
+3. Read:
 
 ```bash
 python run_experiment.py memory-summary
 ```
 
-3. Edit `train.py`.
-4. Run:
+4. Edit `train.py`.
+5. Run:
 
 ```bash
 python run_experiment.py run
 ```
 
-5. Compare validation metrics against local search memory for the current prepared data.
-6. If accepted, run:
+6. Compare validation metrics against local search memory for the current prepared data.
+7. If accepted, run:
 
 ```bash
 python run_experiment.py accept --expected-train-sha <train_sha>
 ```
 
-7. Commit or discard externally.
+8. Commit or discard externally.
 
 Additional guidance:
 
 - Use `memory-summary` to avoid rerunning the same `candidate_signature` or `train_sha`
   unless you are intentionally replicating a result.
+- Use `top_feature_importances` from recent tree-based runs as evidence when planning
+  feature cleanup or adjacent refinement moves.
 - If a new candidate beats the current best by less than `0.10` absolute `val_mape`,
   run a confirmation step before `accept`.
 - If `accept` fails because the default artifact directory already exists, rerun it
@@ -114,6 +126,12 @@ The repo does not own:
 - git keep/discard logic
 - autonomous search control
 - best-model state
+
+`explain.py` is optional and human-first:
+
+- Use it after `accept` when someone wants a deeper interpretation pass.
+- Do not make it part of the per-run optimization loop.
+- It depends on `shap` being installed locally.
 
 ## Editing Guidance
 

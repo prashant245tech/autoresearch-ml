@@ -7,11 +7,13 @@ LLM control, best-model state, or git keep/discard behavior.
 ## Core Files
 
 ```text
-corrugated_automl/
+autoresearch-ml/
 |- program.md        external-agent tuning policy
-|- train.py          the only experiment file the agent edits
+|- baselines/
+|  `- train.generic.py tracked neutral baseline for bootstrapping local train.py
 |- run_experiment.py deterministic runner with `run`, `accept`, and `memory-summary`
 |- search_memory.py  local JSONL search-memory storage and summary logic
+|- explain.py        optional SHAP post-hoc analysis for accepted artifacts
 |- prepare.py        fixed data preparation -> data/train.parquet + data/test.parquet
 |- config/
 |  |- feature_spec.json agent-written prep spec consumed by prepare.py
@@ -21,13 +23,14 @@ corrugated_automl/
 |  |- train.parquet
 |  |- test.parquet
 |  `- columns.json
+|- train.py          local generated working copy (untracked)
 `- models/
    `- accepted/<train_sha[:12]>/
 ```
 
 ## Design
 
-- `train.py` owns the hypothesis:
+- local `train.py` owns the hypothesis:
   - `EXPERIMENT_DESCRIPTION`
   - `engineer_features(df, meta)`
   - `build_model(meta)`
@@ -39,7 +42,9 @@ corrugated_automl/
   - fixed 300-second budget for `run`
   - accepted-model export
   - local search-memory recording and summary retrieval
+- `explain.py` owns optional post-hoc interpretation for accepted artifacts.
 - `program.md` tells the external agent how to iterate.
+- `program.md` also contains the default machine-readable policy thresholds for search behavior.
 
 ## Workflow
 
@@ -75,7 +80,17 @@ data files. Future runs must match that baseline exactly. If you rerun
 
 ### 2. Edit only `train.py`
 
-The external agent reads `program.md`, checks local search memory, and modifies `train.py`.
+Bootstrap a local editable `train.py` first if it does not exist yet:
+
+```bash
+python run_experiment.py init-train
+```
+
+This copies the tracked neutral baseline from
+[baselines/train.generic.py](/Users/prashant/Downloads/corrugated_automl%202/baselines/train.generic.py)
+into a local untracked [train.py](/Users/prashant/Downloads/corrugated_automl%202/train.py).
+
+The external agent then reads `program.md`, checks local search memory, and modifies `train.py`.
 
 ```bash
 python run_experiment.py memory-summary
@@ -95,6 +110,7 @@ This prints a machine-readable JSON summary with:
 - `train_val_mape_gap`, `train_val_mape_ratio`
 - `fit_elapsed_s`, `predict_train_elapsed_s`, `predict_val_elapsed_s`
 - `model_class`, `model_params`
+- `feature_importance_source`, `top_feature_importances` when the fitted model exposes native importances
 - `n_features`, `n_base_features`, `n_derived_features`
 - data fingerprints
 - `session_baseline_path`
@@ -137,6 +153,29 @@ Bundle contents:
 - `feature_columns.json`
 - `train.py`
 - `manifest.json`
+
+### 5. Optional SHAP analysis on an accepted artifact
+
+For a human-facing post-hoc explanation pass on an accepted artifact:
+
+```bash
+python explain.py --artifact-dir models/accepted/<artifact-id> --dataset test
+```
+
+This:
+- loads the accepted `model.pkl`, `feature_columns.json`, and saved `train.py`
+- rebuilds the feature matrix on the requested prepared-data split
+- runs SHAP `TreeExplainer` if `shap` is installed
+- writes a compact JSON summary under `models/accepted/<artifact-id>/explanations/shap_summary.json`
+
+Notes:
+- `explain.py` is opt-in and is not part of the critical search path.
+- It is primarily for human review, not for every-run agent control.
+- If `shap` is not installed, `explain.py` exits cleanly with instructions to install it:
+
+```bash
+python3 -m pip install shap
+```
 
 ## What The Repo Does Not Do
 

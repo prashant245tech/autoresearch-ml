@@ -10,7 +10,7 @@ VALID_TRAIN_SOURCE = """
 import pandas as pd
 from sklearn.linear_model import LinearRegression
 
-EXPERIMENT_DESCRIPTION = "change_type=family_probe | family=LinearRegression | change=baseline"
+EXPERIMENT_DESCRIPTION = "move_intent=explore_new_branch | change_type=family_probe | family=LinearRegression | change=baseline"
 
 def engineer_features(df, meta):
     features = pd.DataFrame(index=df.index)
@@ -24,12 +24,30 @@ def build_model(meta):
 """
 
 
+TREE_TRAIN_SOURCE = """
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+
+EXPERIMENT_DESCRIPTION = "move_intent=explore_new_branch | change_type=family_probe | family=RandomForest | change=tree_baseline"
+
+def engineer_features(df, meta):
+    features = pd.DataFrame(index=df.index)
+    for col in meta.get("model_features", []):
+        if col in df.columns:
+            features[col] = df[col]
+    return features
+
+def build_model(meta):
+    return RandomForestRegressor(n_estimators=25, max_depth=4, random_state=42, n_jobs=1)
+"""
+
+
 INVALID_PREDICT_TRAIN_SOURCE = """
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression
 
-EXPERIMENT_DESCRIPTION = "change_type=invalid | family=LinearRegression | change=bad_predict_shape"
+EXPERIMENT_DESCRIPTION = "move_intent=exploit_current_winner | change_type=invalid | family=LinearRegression | change=bad_predict_shape"
 
 def engineer_features(df, meta):
     features = pd.DataFrame(index=df.index)
@@ -47,6 +65,87 @@ def predict_model(model, X):
 
 
 class RunExperimentTests(WorkspaceTestCase):
+    def write_baseline_train(self, content: str = VALID_TRAIN_SOURCE):
+        self.write_text(run_experiment.DEFAULT_BASELINE_TRAIN_PATH, content)
+
+    def test_init_train_once_creates_local_train_from_baseline(self):
+        self.write_baseline_train()
+
+        summary, exit_code = run_experiment.init_train_once()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["status"], run_experiment.STATUS_OK)
+        self.assertEqual(summary["baseline_path"], run_experiment.DEFAULT_BASELINE_TRAIN_PATH)
+        self.assertTrue(self.abs_path("train.py").exists())
+        self.assertEqual(self.abs_path("train.py").read_text(), VALID_TRAIN_SOURCE)
+
+    def test_init_train_once_requires_force_to_replace_existing_train(self):
+        self.write_baseline_train(VALID_TRAIN_SOURCE)
+        self.write_text("train.py", TREE_TRAIN_SOURCE)
+
+        summary, exit_code = run_experiment.init_train_once()
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(summary["status"], run_experiment.STATUS_INIT_FAILED)
+        self.assertIn("already exists", summary["error"])
+        self.assertEqual(self.abs_path("train.py").read_text(), TREE_TRAIN_SOURCE)
+
+    def test_parse_experiment_description_extracts_structured_fields(self):
+        parsed = search_memory.parse_experiment_description(
+            "move_intent=explore_new_branch | change_type=family_probe | family=LinearRegression | change=baseline | hypothesis=test branch"
+        )
+
+        self.assertEqual(parsed["move_intent"], "explore_new_branch")
+        self.assertEqual(parsed["change_type"], "family_probe")
+        self.assertEqual(parsed["declared_family"], "LinearRegression")
+        self.assertEqual(parsed["change_summary"], "baseline")
+        self.assertEqual(parsed["hypothesis"], "test branch")
+
+    def test_build_summary_recovers_description_fields_from_legacy_events(self):
+        legacy_event = {
+            "event_id": "evt-1",
+            "event_type": search_memory.EVENT_TYPE_RUN,
+            "recorded_at": "2026-03-22T09:00:00",
+            "prepared_data_sha": "prep-1",
+            "train_sha": "train-1",
+            "experiment_description": (
+                "move_intent=explore_new_branch | "
+                "change_type=family_probe | "
+                "family=LinearRegression | "
+                "change=baseline | "
+                "hypothesis=test branch"
+            ),
+            "status": run_experiment.STATUS_OK,
+            "model_class": "LinearRegression",
+            "model_params": {"fit_intercept": True},
+            "candidate_signature": "cand-1",
+            "model_signature": "model-1",
+            "feature_signature": "feat-1",
+            "feature_names": ["feature_a"],
+            "n_features": 1,
+            "n_base_features": 1,
+            "n_derived_features": 0,
+            "train_mape": 1.0,
+            "val_mape": 2.0,
+            "val_rmse": 3.0,
+            "val_r2": 0.5,
+        }
+
+        summary = search_memory.build_summary([legacy_event], "prep-1")
+
+        self.assertEqual(
+            summary["move_intent_distribution"],
+            {"explore_new_branch": 1},
+        )
+        self.assertEqual(summary["best_run"]["move_intent"], "explore_new_branch")
+        self.assertEqual(summary["best_run"]["change_type"], "family_probe")
+        self.assertEqual(summary["best_run"]["declared_family"], "LinearRegression")
+        self.assertEqual(summary["family_branch_depth"]["latest_move_intent"], "explore_new_branch")
+        self.assertEqual(
+            summary["recent_events"][0]["move_intent"],
+            "explore_new_branch",
+        )
+
     def load_search_events(self):
         path = self.abs_path(search_memory.SEARCH_MEMORY_PATH)
         if not path.exists():
@@ -59,7 +158,8 @@ class RunExperimentTests(WorkspaceTestCase):
         return json.loads(path.read_text())
 
     def test_ensure_prepared_data_baseline_creates_and_enforces_session_hashes(self):
-        baseline_train_df, _test_df, _meta = self.create_prepared_data()
+        baseline_train_df, _test_df, meta = self.create_prepared_data()
+        target_column = meta["target"]
 
         baseline = run_experiment.ensure_prepared_data_baseline()
 
@@ -67,7 +167,7 @@ class RunExperimentTests(WorkspaceTestCase):
         self.assertIn("prepared_data_sha", baseline)
 
         mutated_train = baseline_train_df.copy()
-        mutated_train.loc[0, "price_msf"] += 1.0
+        mutated_train.loc[0, target_column] += 1.0
         self.write_parquet("data/train.parquet", mutated_train)
 
         with self.assertRaises(run_experiment.PreparedDataMismatchError):
@@ -92,9 +192,45 @@ class RunExperimentTests(WorkspaceTestCase):
         self.assertEqual(events[0]["event_type"], search_memory.EVENT_TYPE_RUN)
         self.assertEqual(events[0]["status"], run_experiment.STATUS_OK)
         self.assertTrue(events[0]["candidate_signature"])
+        self.assertEqual(events[0]["move_intent"], "explore_new_branch")
+        self.assertEqual(events[0]["change_type"], "family_probe")
+        self.assertEqual(events[0]["declared_family"], "LinearRegression")
         search_summary = self.load_search_summary()
         self.assertEqual(search_summary["counts"]["total_runs"], 1)
         self.assertEqual(search_summary["counts"]["successful_runs"], 1)
+        self.assertEqual(
+            search_summary["move_intent_distribution"],
+            {"explore_new_branch": 1},
+        )
+        self.assertEqual(
+            search_summary["family_branch_depth"]["model_class"],
+            "LinearRegression",
+        )
+        self.assertEqual(search_summary["family_branch_depth"]["depth"], 1)
+
+    def test_run_once_emits_top_feature_importances_for_tree_models(self):
+        self.create_prepared_data()
+        self.write_text("train.py", TREE_TRAIN_SOURCE)
+
+        summary, exit_code = run_experiment.run_once()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["status"], run_experiment.STATUS_OK)
+        self.assertEqual(summary["model_class"], "RandomForestRegressor")
+        self.assertEqual(summary["feature_importance_source"], "feature_importances_")
+        self.assertEqual(summary["top_feature_importances"], {"x": 1.0})
+
+        events = self.load_search_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["feature_importance_source"], "feature_importances_")
+        self.assertEqual(events[0]["top_feature_importances"], {"x": 1.0})
+        search_summary = self.load_search_summary()
+        self.assertEqual(search_summary["best_run"]["feature_importance_source"], "feature_importances_")
+        self.assertEqual(search_summary["best_run"]["top_feature_importances"], {"x": 1.0})
+        self.assertEqual(
+            search_summary["recent_events"][0]["top_feature_importances"],
+            {"x": 1.0},
+        )
 
     def test_run_once_reports_invalid_candidate_for_bad_prediction_shape(self):
         self.create_prepared_data()
@@ -179,7 +315,8 @@ class RunExperimentTests(WorkspaceTestCase):
         self.assertEqual(search_summary["counts"]["failed_accepts"], 0)
 
     def test_run_once_prepared_data_mismatch_does_not_record_search_memory(self):
-        baseline_train_df, _test_df, _meta = self.create_prepared_data()
+        baseline_train_df, _test_df, meta = self.create_prepared_data()
+        target_column = meta["target"]
         self.write_text("train.py", VALID_TRAIN_SOURCE)
 
         baseline_run, baseline_exit = run_experiment.run_once()
@@ -187,7 +324,7 @@ class RunExperimentTests(WorkspaceTestCase):
         self.assertEqual(len(self.load_search_events()), 1)
 
         mutated_train = baseline_train_df.copy()
-        mutated_train.loc[0, "price_msf"] += 10.0
+        mutated_train.loc[0, target_column] += 10.0
         self.write_parquet("data/train.parquet", mutated_train)
 
         summary, exit_code = run_experiment.run_once()
@@ -207,6 +344,8 @@ class RunExperimentTests(WorkspaceTestCase):
         self.assertEqual(summary["counts"]["total_runs"], 0)
         self.assertEqual(summary["counts"]["accepts"], 0)
         self.assertEqual(summary["recent_events"], [])
+        self.assertEqual(summary["move_intent_distribution"], {})
+        self.assertIsNone(summary["family_branch_depth"])
         self.assertTrue(self.abs_path(search_memory.SEARCH_SUMMARY_PATH).exists())
         self.assertFalse(self.abs_path(search_memory.SEARCH_MEMORY_PATH).exists())
 
@@ -236,9 +375,14 @@ class RunExperimentTests(WorkspaceTestCase):
             search_summary["repeated_exact_runs"][0]["candidate_signature"],
             candidate_signature,
         )
+        self.assertEqual(
+            search_summary["move_intent_distribution"],
+            {"explore_new_branch": 2},
+        )
 
     def test_search_summary_is_scoped_to_current_prepared_data_sha(self):
-        baseline_train_df, _test_df, _meta = self.create_prepared_data()
+        baseline_train_df, _test_df, meta = self.create_prepared_data()
+        target_column = meta["target"]
         self.write_text("train.py", VALID_TRAIN_SOURCE)
 
         first_summary, first_exit = run_experiment.run_once()
@@ -247,7 +391,7 @@ class RunExperimentTests(WorkspaceTestCase):
 
         self.abs_path("experiments/session_baseline.json").unlink()
         mutated_train = baseline_train_df.copy()
-        mutated_train.loc[:, "price_msf"] = mutated_train["price_msf"] + 25.0
+        mutated_train.loc[:, target_column] = mutated_train[target_column] + 25.0
         self.write_parquet("data/train.parquet", mutated_train)
 
         second_summary, second_exit = run_experiment.run_once()

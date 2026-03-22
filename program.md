@@ -1,6 +1,6 @@
 # program.md - External agent workflow and generic ML tuning policy
 
-This file guides the external agent that edits `train.py`.
+This file guides the external agent that edits the local generated `train.py`.
 It is not consumed by `run_experiment.py`.
 
 ## External Agent Loop
@@ -31,21 +31,22 @@ If the prepared parquet files do not exist yet, or if the dataset definition has
 ### Tuning phase
 
 1. Read this file before proposing a change.
-2. Read `python run_experiment.py memory-summary` to understand prior runs for the current prepared data.
-3. Edit `train.py` only.
-4. Run `python run_experiment.py run`.
-5. Compare the returned validation metrics against search memory for the current prepared data.
-6. Keep or discard the `train.py` change externally.
-7. If you reran `prepare.py` since the last accepted run, delete
+2. If `train.py` does not exist yet, run `python run_experiment.py init-train`.
+3. Read `python run_experiment.py memory-summary` to understand prior runs for the current prepared data.
+4. Edit `train.py` only.
+5. Run `python run_experiment.py run`.
+6. Compare the returned validation metrics against search memory for the current prepared data.
+7. Keep or discard the `train.py` change externally.
+8. If you reran `prepare.py` since the last accepted run, delete
    `experiments/session_baseline.json` before continuing so the new tuning
    session gets a clean prepared-data baseline.
-8. If you keep it, run:
+9. If you keep it, run:
 
 ```bash
 python run_experiment.py accept --expected-train-sha <train_sha>
 ```
 
-9. Commit or discard externally. The repo itself does not manage git, autonomous
+10. Commit or discard externally. The repo itself does not manage git, autonomous
    search control, or best-model state.
 
 ## Fixed Protocol
@@ -57,6 +58,7 @@ python run_experiment.py accept --expected-train-sha <train_sha>
 - `experiments/search_summary.json` is the current prepared-data-scoped summary.
 - `run_experiment.py run` creates the deterministic internal validation split.
 - `run_experiment.py memory-summary` prints the current prepared-data-scoped search summary.
+- `explain.py` is an optional post-hoc interpretation tool for accepted artifacts; it is not part of the fast search loop.
 - Validation metrics are the search signal.
 - Test metrics are audit-only and are produced during `accept`.
 - The fixed experiment budget for `run` is 300 seconds.
@@ -64,7 +66,7 @@ python run_experiment.py accept --expected-train-sha <train_sha>
 
 ## Editable Surface
 
-Edit only `train.py`, specifically:
+Edit only the local generated `train.py`, specifically:
 - `EXPERIMENT_DESCRIPTION`
 - `engineer_features(df, meta)`
 - `build_model(meta)`
@@ -82,6 +84,7 @@ The runner owns splitting, metric computation, and artifact export.
 - `fit_elapsed_s`, `predict_train_elapsed_s`, `predict_val_elapsed_s`
 - `elapsed_budget_fraction`
 - `model_class`, `model_params`
+- `feature_importance_source`, `top_feature_importances` when the fitted model exposes native importances
 - `n_train_rows`, `n_val_rows`
 - `n_features`, `n_base_features`, `n_derived_features`
 - `base_feature_names`, `derived_feature_names`, `omitted_base_feature_names`
@@ -116,6 +119,20 @@ Recommended `move_intent` values:
   - make a nearby refinement around the current best candidate
 - `confirm_replicate`
   - deliberately rerun or closely confirm a result when the gain is small and confidence matters
+
+### Policy Config
+
+Use this machine-readable policy block as the default threshold surface for
+external agents and future deterministic controllers:
+
+```yaml
+tiny_gain_abs_mape: 0.10
+require_confirmation_below_abs_gain: 0.10
+max_exploit_streak_before_explore: 3
+family_probe_pause_after_clear_losses: 2
+branch_cooldown_after_consecutive_losses: 3
+regularization_pause_after_losses: 2
+```
 
 ### Default search order
 
@@ -180,6 +197,7 @@ be clearly different in either:
 - If train metrics are strong but validation is weak, prefer regularization, shallower trees, larger leaves, or fewer derived interactions.
 - If runtime rises materially without validation gain, prefer the cheaper model or smaller configuration.
 - If the derived-feature count grows while validation stalls, try feature cleanup before more model tuning.
+- If recent tree-based runs expose `top_feature_importances`, use them as evidence for cleanup and refinement moves rather than pruning derived features blindly.
 
 ### Practical hyperparameter guidance
 

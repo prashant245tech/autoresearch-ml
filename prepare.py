@@ -537,7 +537,7 @@ def apply_encodings(df: pd.DataFrame, features: list, encoding_meta: dict) -> pd
     return df
 
 
-def build_matrix(df: pd.DataFrame, features: list, encoding_meta: dict):
+def build_matrix(df: pd.DataFrame, features: list, encoding_meta: dict, target_col: str):
     model_cols, ref_cols = [], []
     for feat in features:
         col = feat["column"]
@@ -562,7 +562,7 @@ def build_matrix(df: pd.DataFrame, features: list, encoding_meta: dict):
             if raw_col in df.columns:
                 ref_cols.append(raw_col)
 
-    all_cols = [col for col in model_cols + ref_cols + ["price_msf"] if col in df.columns]
+    all_cols = [col for col in model_cols + ref_cols + [target_col] if col in df.columns]
     return df[all_cols].reset_index(drop=True), model_cols, ref_cols
 
 
@@ -571,6 +571,7 @@ def prepare_dataset(
     features: list,
     filter_specs: list,
     target_col: str,
+    output_target_col: str,
     spec: dict,
     dataset_label: str,
     row_filters: list,
@@ -589,7 +590,8 @@ def prepare_dataset(
         dataset_label=dataset_label,
         apply_outlier_filter=apply_outlier_filter,
     )
-    df = df.rename(columns={target_col: "price_msf"})
+    if target_col != output_target_col:
+        df = df.rename(columns={target_col: output_target_col})
     return df
 
 
@@ -624,6 +626,7 @@ def main():
         features,
         filter_specs,
         target_col=target,
+        output_target_col=target,
         spec=spec,
         dataset_label="train source",
         row_filters=train_filters,
@@ -632,7 +635,7 @@ def main():
 
     encoding_meta = fit_encoding_meta(train_prepared, features)
     train_encoded = apply_encodings(train_prepared, features, encoding_meta)
-    train_final, model_cols, ref_cols = build_matrix(train_encoded, features, encoding_meta)
+    train_final, model_cols, ref_cols = build_matrix(train_encoded, features, encoding_meta, target)
 
     if test_data_file:
         test_raw = load_table(test_data_file)
@@ -641,6 +644,7 @@ def main():
             features,
             filter_specs,
             target_col=test_target_column,
+            output_target_col=target,
             spec=spec,
             dataset_label="test source",
             row_filters=test_filters,
@@ -648,7 +652,7 @@ def main():
         )
         test_encoded = apply_encodings(test_prepared, features, encoding_meta)
         test_final, _unused_model_cols, _unused_ref_cols = build_matrix(
-            test_encoded, features, encoding_meta
+            test_encoded, features, encoding_meta, target
         )
         train_df = train_final.reset_index(drop=True)
         test_df = test_final.reset_index(drop=True)
@@ -668,7 +672,7 @@ def main():
     print(f"[prepare] Model features   : {model_cols}")
     print(f"[prepare] Ref columns      : {ref_cols}")
     print(f"\n[prepare] Price/MSF stats (train prepared source):")
-    print(train_final["price_msf"].describe().to_string())
+    print(train_final[target].describe().to_string())
 
     train_df.to_parquet(TRAIN_PATH, index=False)
     test_df.to_parquet(TEST_PATH, index=False)
@@ -676,7 +680,7 @@ def main():
     print(f"[prepare] Saved → {TEST_PATH}   ({len(test_df):,} rows)")
 
     meta = {
-        "target": "price_msf",
+        "target": target,
         "model_features": model_cols,
         "ref_cols": ref_cols,
         "encoding": encoding_meta,
@@ -693,9 +697,9 @@ def main():
         },
         "n_train": len(train_df),
         "n_test": len(test_df),
-        "price_msf_stats": {
+        "target_stats": {
             key: round(float(value), 4)
-            for key, value in train_final["price_msf"].describe().items()
+            for key, value in train_final[target].describe().items()
         },
     }
     with open(META_PATH, "w") as handle:

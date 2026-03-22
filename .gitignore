@@ -2,6 +2,7 @@
 __pycache__/
 .DS_Store
 .env
+train.py
 config/feature_spec.json
 config/task_context.md
 data/
