@@ -8,6 +8,8 @@ data/
 experiments/results.json
 experiments/results.csv
 experiments/research_state.json
+experiments/search_memory.jsonl
+experiments/search_summary.json
 models/best_model.pkl
 models/best_features.pkl
 models/best_train.py

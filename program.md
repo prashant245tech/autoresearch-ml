@@ -31,28 +31,32 @@ If the prepared parquet files do not exist yet, or if the dataset definition has
 ### Tuning phase
 
 1. Read this file before proposing a change.
-2. Edit `train.py` only.
-3. Run `python run_experiment.py run`.
-4. Compare the returned validation metrics against your own accepted-run history.
-5. Keep or discard the `train.py` change externally.
-6. If you reran `prepare.py` since the last accepted run, delete
+2. Read `python run_experiment.py memory-summary` to understand prior runs for the current prepared data.
+3. Edit `train.py` only.
+4. Run `python run_experiment.py run`.
+5. Compare the returned validation metrics against search memory for the current prepared data.
+6. Keep or discard the `train.py` change externally.
+7. If you reran `prepare.py` since the last accepted run, delete
    `experiments/session_baseline.json` before continuing so the new tuning
    session gets a clean prepared-data baseline.
-7. If you keep it, run:
+8. If you keep it, run:
 
 ```bash
 python run_experiment.py accept --expected-train-sha <train_sha>
 ```
 
-8. Commit or discard externally. The repo itself does not manage git, experiment
-   history, or best-model state.
+9. Commit or discard externally. The repo itself does not manage git, autonomous
+   search control, or best-model state.
 
 ## Fixed Protocol
 
 - `prepare.py` defines the frozen `data/train.parquet` and `data/test.parquet` boundary.
 - `experiments/session_baseline.json` enforces that the prepared-data hashes stay fixed
   for the tuning session.
+- `experiments/search_memory.jsonl` records run/accept events automatically.
+- `experiments/search_summary.json` is the current prepared-data-scoped summary.
 - `run_experiment.py run` creates the deterministic internal validation split.
+- `run_experiment.py memory-summary` prints the current prepared-data-scoped search summary.
 - Validation metrics are the search signal.
 - Test metrics are audit-only and are produced during `accept`.
 - The fixed experiment budget for `run` is 300 seconds.
@@ -90,16 +94,28 @@ The runner owns splitting, metric computation, and artifact export.
 - Prefer reversible, readable edits over large rewrites.
 - Search on validation metrics only. Never choose experiments based on test results.
 - Use `EXPERIMENT_DESCRIPTION` to state the change type, the concrete edit, and the hypothesis.
+- Treat `python run_experiment.py memory-summary` as the source of truth for what has already been tried on the current prepared data.
+- Do not rerun the same `candidate_signature` or same `train_sha` unless you are intentionally replicating a result.
+- Treat workflow errors, such as an existing artifact directory during `accept`, as operational issues rather than model evidence.
 
 Recommended format:
 
 ```python
 EXPERIMENT_DESCRIPTION = (
+    "move_intent=exploit_current_winner | "
     "change_type=param_refine | family=HistGradientBoosting | "
     "change=max_depth 8->12 | "
     "hypothesis=reduce underfitting on nonlinear interactions"
 )
 ```
+
+Recommended `move_intent` values:
+- `explore_new_branch`
+  - try a new family, a new feature block, or a genuinely different local branch
+- `exploit_current_winner`
+  - make a nearby refinement around the current best candidate
+- `confirm_replicate`
+  - deliberately rerun or closely confirm a result when the gain is small and confidence matters
 
 ### Default search order
 
@@ -108,6 +124,19 @@ EXPERIMENT_DESCRIPTION = (
 3. Once one family clearly leads, spend a few runs on local hyperparameter refinement.
 4. When model tuning plateaus, try one feature block change.
 5. After an accepted feature improvement, retune the current best model family once.
+
+Keep exploration and exploitation balanced:
+- after `2-3` consecutive `exploit_current_winner` moves, prefer one `explore_new_branch` move unless the current branch is still improving clearly
+- if a move produces only a tiny gain relative to recent deltas, prefer one `confirm_replicate` or one adjacent confirmation move before committing too heavily to that branch
+
+### Confirmation rule
+
+- If a new candidate improves the current best `val_mape` by less than `0.10` absolute MAPE points, do not `accept` it immediately.
+- First run either:
+  - one `confirm_replicate` of the same candidate, or
+  - one adjacent confirmation move that keeps the same branch but tests whether the gain is robust
+- Only promote the candidate to `accept` if the confirmation step still supports the improvement.
+- If the confirmation step fails, keep the prior accepted candidate even if the first run looked slightly better.
 
 ### Suggested change types
 
@@ -124,11 +153,26 @@ EXPERIMENT_DESCRIPTION = (
   - Remove noisy or redundant features after several weak feature additions.
   - Keep the rest of the experiment stable.
 
+For every proposed run, compare the candidate against the nearest prior entry in
+`memory-summary` and make sure the change is genuinely novel. The next run should
+be clearly different in either:
+- model family
+- hyperparameter neighborhood
+- feature block
+- cleanup target
+
 ### Switching criteria
 
 - If multiple family probes have not been tried yet, prioritize family exploration before deep tuning.
 - If one family is clearly ahead, stay within that family for a short local sweep before switching again.
+- If 2 family probes are both clearly worse than the current best family, pause more family probes until the best candidate changes materially or the prepared data changes.
 - If 3 consecutive parameter tweaks fail to improve validation metrics, switch to a different family or a feature change.
+- If 2 strong regularization moves both shrink the train/validation gap but worsen validation MAPE materially, stop pushing that regularization branch.
+- If a feature cleanup wins, prefer either one adjacent cleanup or one local parameter refinement before opening a new model-family branch.
+- If a branch has 3 consecutive losses, put that branch on cooldown and do not revisit it immediately.
+- If a branch is on cooldown, reopen it only after either:
+  - the current best candidate changes materially, or
+  - a different exploratory branch also stalls
 - If several families are very close, prefer the simpler or faster one.
 - If runtime approaches the budget, favor cheaper models or smaller configurations.
 - If `train_val_mape_gap` is large or `train_val_mape_ratio` is well above 1.0, simplify or regularize.
@@ -158,6 +202,21 @@ EXPERIMENT_DESCRIPTION = (
   - inspect whether `engineer_features()` is unintentionally dropping useful prepared inputs
 - `derived features dominate with no gain`
   - run a cleanup or family probe instead of stacking more interactions
+- `same candidate appears repeatedly in memory-summary`
+  - stop rerunning it and branch to an adjacent hypothesis instead
+- `accept failed because output_dir already exists`
+  - rerun `accept` with a unique `--output-dir`; do not treat the failure as a search result
+
+### Search-quality guardrails
+
+- Do not let the search stay in pure exploitation indefinitely.
+- Do not let one small win automatically collapse exploration.
+- Do not treat every validation gain as equally meaningful; consider whether it is large enough to justify committing the branch.
+- Do not revisit a losing branch immediately just because its hypothesis still sounds plausible.
+- Prefer search trajectories that make it easy to explain:
+  - what branch you are in
+  - why the branch is being explored
+  - what evidence would cause you to continue, cool down, or abandon it
 
 ## Task-Specific Context
 

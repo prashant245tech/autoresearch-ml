@@ -9,6 +9,7 @@ This repo is a generic, agent-guided ML experimentation framework:
 - `prepare.py` freezes the data boundary
 - `train.py` is the editable experiment hypothesis
 - `run_experiment.py` is the deterministic evaluation and export harness
+- `search_memory.py` stores local run/accept history and summaries
 - `program.md` is the generic external-agent tuning policy
 
 The design goal is a thin, reliable protocol surface around an editable training spec.
@@ -19,6 +20,7 @@ Tracked framework files:
 
 - `prepare.py`
 - `run_experiment.py`
+- `search_memory.py`
 - `train.py`
 - `program.md`
 - `README.md`
@@ -35,6 +37,8 @@ Generated untracked artifacts:
 - `data/`
 - `models/accepted/`
 - `experiments/session_baseline.json`
+- `experiments/search_memory.jsonl`
+- `experiments/search_summary.json`
 
 Do not move task-specific dataset paths, cohort rules, or business/domain notes into tracked files unless the user explicitly wants a repo example.
 
@@ -73,28 +77,43 @@ Important:
 Use this flow during model iteration:
 
 1. Read `program.md`.
-2. Edit `train.py`.
-3. Run:
+2. Read:
+
+```bash
+python run_experiment.py memory-summary
+```
+
+3. Edit `train.py`.
+4. Run:
 
 ```bash
 python run_experiment.py run
 ```
 
-4. Compare validation metrics against prior accepted runs outside the repo.
-5. If accepted, run:
+5. Compare validation metrics against local search memory for the current prepared data.
+6. If accepted, run:
 
 ```bash
 python run_experiment.py accept --expected-train-sha <train_sha>
 ```
 
-6. Commit or discard externally.
+7. Commit or discard externally.
+
+Additional guidance:
+
+- Use `memory-summary` to avoid rerunning the same `candidate_signature` or `train_sha`
+  unless you are intentionally replicating a result.
+- If a new candidate beats the current best by less than `0.10` absolute `val_mape`,
+  run a confirmation step before `accept`.
+- If `accept` fails because the default artifact directory already exists, rerun it
+  with a unique `--output-dir` and do not treat that workflow failure as search evidence.
 
 The repo does not own:
 
 - LLM invocation
 - git keep/discard logic
-- leaderboard state
-- best-model memory
+- autonomous search control
+- best-model state
 
 ## Editing Guidance
 
@@ -125,6 +144,8 @@ The test suite uses temporary workspaces and should not mutate local task files 
 ## Common Pitfalls
 
 - Forgetting to delete `experiments/session_baseline.json` after rerunning `prepare.py`
+- Ignoring `python run_experiment.py memory-summary` before choosing the next edit
+- Repeating a candidate already present in search memory without a deliberate replicate reason
 - Putting real dataset paths into `program.md` or `README.md`
 - Using filtered columns without declaring them in `features` or `filter_specs`
 - Mixing model-family changes and feature changes in one tuning step

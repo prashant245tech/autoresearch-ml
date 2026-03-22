@@ -20,9 +20,10 @@ from sklearn.ensemble import ExtraTreesRegressor
 
 
 EXPERIMENT_DESCRIPTION = (
+    "move_intent=explore_new_branch | "
     "change_type=feature_probe | family=ExtraTrees | "
-    "change=add back log_total_board only on the simplified TreeHouse MODEL feature block | "
-    "hypothesis=aggregate board consumption may still help without the noisier mass-based proxies"
+    "change=add catalog_x_size_bucket and catalog_x_ink_bucket on top of the current winner | "
+    "hypothesis=separating catalog-style rows from live-order rows within size and print regimes may capture a distinct pricing pattern"
 )
 
 
@@ -51,7 +52,6 @@ def engineer_features(df: pd.DataFrame, meta: dict) -> pd.DataFrame:
     if "Quantity" in df.columns:
         qty = df["Quantity"].clip(lower=0)
         fe["qty_log"] = np.log1p(qty)
-        fe["has_quantity"] = (qty > 0).astype(int)
 
     # Encoded ordinals clipped non-negative (sentinel -1 already handled)
     size_bucket = None
@@ -86,20 +86,25 @@ def engineer_features(df: pd.DataFrame, meta: dict) -> pd.DataFrame:
         fe["area_x_ink_bucket"] = sqft * ink_bucket
         if size_bucket is not None:
             fe["size_x_ink_bucket"] = size_bucket * ink_bucket
+        if "Flute 1_encoded" in df.columns:
+            flute = df["Flute 1_encoded"].clip(lower=0)
+            fe["flute_x_ink_bucket"] = flute * ink_bucket
     if size_bucket is not None and "qty_log" in fe.columns and sqft is not None:
         fe["area_x_size_bucket"] = sqft * size_bucket
-        fe["qty_x_size_bucket"] = fe["qty_log"] * size_bucket
     if "qty_log" in fe.columns and ink_bucket is not None:
         fe["qty_x_ink_bucket"] = fe["qty_log"] * ink_bucket
 
     if "Tare Weight" in df.columns and sqft is not None:
-        fe["weight_per_sqft"] = df["Tare Weight"] / (sqft + 1e-6)
         # Add log tare weight to capture diminishing returns of weight effect
         fe["log_tare_weight"] = np.log1p(df["Tare Weight"].clip(lower=0.001))
 
     # Add catalog price flag (has_quantity already added)
     if "Quantity" in df.columns:
         fe["is_catalog_price"] = (df["Quantity"] == 0).astype(int)
+        if size_bucket is not None:
+            fe["catalog_x_size_bucket"] = fe["is_catalog_price"] * size_bucket
+        if ink_bucket is not None:
+            fe["catalog_x_ink_bucket"] = fe["is_catalog_price"] * ink_bucket
 
     return fe
 
@@ -112,7 +117,7 @@ def build_model(meta: dict):
         n_estimators=900,
         max_depth=20,
         min_samples_leaf=1,
-        max_features=0.65,
+        max_features=0.55,
         criterion="absolute_error",
         random_state=42,
         n_jobs=-1,

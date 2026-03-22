@@ -6,11 +6,12 @@ This file owns:
 - deterministic train/validation splitting
 - validation scoring under a fixed budget
 - acceptance/export of a selected train.py variant
+- local search-memory recording and summary retrieval
 
 This file does not own:
 - LLM calls
 - git workflow
-- experiment history
+- autonomous search control
 - best-model state
 """
 
@@ -33,6 +34,7 @@ from typing import Optional
 import joblib
 import numpy as np
 import pandas as pd
+import search_memory
 from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
 
@@ -174,6 +176,12 @@ def ensure_prepared_data_baseline() -> dict:
         )
 
     return fingerprints
+
+
+def current_prepared_data_sha_or_none() -> Optional[str]:
+    if not all(os.path.exists(path) for path in [TRAIN_DATA_PATH, TEST_DATA_PATH, META_PATH]):
+        return None
+    return prepared_data_fingerprints().get("prepared_data_sha")
 
 
 def split_train_for_validation(train_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -500,6 +508,10 @@ def fit_and_score_with_budget(
     return result
 
 
+def record_search_memory(event_type: str, payload: dict) -> Optional[dict]:
+    return search_memory.record_event(event_type, payload)
+
+
 def run_once() -> tuple[dict, int]:
     start_time = time.monotonic()
 
@@ -560,9 +572,11 @@ def run_once() -> tuple[dict, int]:
             summary["train_val_mape_gap"] = worker_result["train_val_mape_gap"]
             summary["train_val_rmse_gap"] = worker_result["train_val_rmse_gap"]
             summary["train_val_mape_ratio"] = worker_result["train_val_mape_ratio"]
+            record_search_memory(search_memory.EVENT_TYPE_RUN, summary)
             return summary, 0
 
         summary["error"] = worker_result.get("error")
+        record_search_memory(search_memory.EVENT_TYPE_RUN, summary)
         return summary, 1
     except Exception as exc:
         failure = {
@@ -579,6 +593,7 @@ def run_once() -> tuple[dict, int]:
         if all(os.path.exists(path) for path in [TRAIN_DATA_PATH, TEST_DATA_PATH, META_PATH]):
             failure.update(prepared_data_fingerprints())
         failure["session_baseline_path"] = SESSION_BASELINE_PATH
+        record_search_memory(search_memory.EVENT_TYPE_RUN, failure)
         return failure, 1
 
 
@@ -663,6 +678,7 @@ def accept_once(expected_train_sha: str, output_dir: Optional[str] = None) -> tu
         with open(manifest_path, "w") as handle:
             json.dump(manifest, handle, indent=2, sort_keys=True)
 
+        record_search_memory(search_memory.EVENT_TYPE_ACCEPT, manifest)
         return manifest, 0
     except Exception as exc:
         if output_path is not None and output_path.exists():
@@ -681,7 +697,27 @@ def accept_once(expected_train_sha: str, output_dir: Optional[str] = None) -> tu
         if all(os.path.exists(path) for path in [TRAIN_DATA_PATH, TEST_DATA_PATH, META_PATH]):
             failure.update(prepared_data_fingerprints())
         failure["session_baseline_path"] = SESSION_BASELINE_PATH
+        record_search_memory(search_memory.EVENT_TYPE_ACCEPT, failure)
         return failure, 1
+
+
+def memory_summary_once() -> tuple[dict, int]:
+    try:
+        summary = search_memory.get_or_rebuild_summary(
+            prepared_data_sha=current_prepared_data_sha_or_none()
+        )
+        return summary, 0
+    except Exception as exc:
+        return (
+            {
+                "status": STATUS_TRAIN_FAILED,
+                "error": str(exc),
+                "search_memory_path": search_memory.SEARCH_MEMORY_PATH,
+                "search_summary_path": search_memory.SEARCH_SUMMARY_PATH,
+                "prepared_data_sha": current_prepared_data_sha_or_none(),
+            },
+            1,
+        )
 
 
 def run_single_from_train_entrypoint() -> None:
@@ -696,6 +732,10 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("run", help="Run validation-only evaluation for the current train.py")
+    subparsers.add_parser(
+        "memory-summary",
+        help="Print the current prepared-data-scoped search-memory summary",
+    )
 
     accept_parser = subparsers.add_parser(
         "accept",
@@ -720,6 +760,8 @@ def main() -> int:
 
     if args.command == "run":
         summary, exit_code = run_once()
+    elif args.command == "memory-summary":
+        summary, exit_code = memory_summary_once()
     else:
         summary, exit_code = accept_once(args.expected_train_sha, args.output_dir)
 

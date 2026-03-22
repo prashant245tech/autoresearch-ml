@@ -10,7 +10,8 @@ LLM control, best-model state, or git keep/discard behavior.
 corrugated_automl/
 |- program.md        external-agent tuning policy
 |- train.py          the only experiment file the agent edits
-|- run_experiment.py deterministic runner with `run` and `accept`
+|- run_experiment.py deterministic runner with `run`, `accept`, and `memory-summary`
+|- search_memory.py  local JSONL search-memory storage and summary logic
 |- prepare.py        fixed data preparation -> data/train.parquet + data/test.parquet
 |- config/
 |  |- feature_spec.json agent-written prep spec consumed by prepare.py
@@ -37,6 +38,7 @@ corrugated_automl/
   - validation scoring
   - fixed 300-second budget for `run`
   - accepted-model export
+  - local search-memory recording and summary retrieval
 - `program.md` tells the external agent how to iterate.
 
 ## Workflow
@@ -73,7 +75,11 @@ data files. Future runs must match that baseline exactly. If you rerun
 
 ### 2. Edit only `train.py`
 
-The external agent reads `program.md` and modifies `train.py`.
+The external agent reads `program.md`, checks local search memory, and modifies `train.py`.
+
+```bash
+python run_experiment.py memory-summary
+```
 
 ### 3. Run one experiment
 
@@ -96,6 +102,13 @@ This prints a machine-readable JSON summary with:
 
 `python train.py` is a convenience alias for the same validation-only run.
 
+Each `run` also appends a local search-memory event to:
+- `experiments/search_memory.jsonl`
+- `experiments/search_summary.json`
+
+Use `memory-summary` to avoid repeating the same `candidate_signature` or `train_sha`
+unless you intentionally want a replicate run.
+
 ### 4. Accept and save a model
 
 If the external agent decides to keep the current `train.py`, run:
@@ -110,6 +123,14 @@ This:
 - retrains on all of `data/train.parquet`
 - evaluates audit metrics on `data/test.parquet`
 - saves an artifact bundle under `models/accepted/<train_sha[:12]>`
+- appends a successful `accept` event to local search memory
+
+Before `accept`, apply the default confirmation rule:
+- if the new candidate improves the current best `val_mape` by less than `0.10`
+  absolute MAPE points, run one confirmation step first instead of accepting immediately
+
+If the default artifact directory already exists, rerun `accept` with a unique
+`--output-dir`. Treat that as workflow noise, not as model evidence.
 
 Bundle contents:
 - `model.pkl`
@@ -121,7 +142,7 @@ Bundle contents:
 
 - no internal LLM loop
 - no git commit or reset logic
-- no `results.json` / `results.csv` leaderboard management
+- no automatic next-step search controller
 - no repo-owned "best model" state
 
 Those responsibilities belong to the external agent or your surrounding workflow.
@@ -134,6 +155,8 @@ Those responsibilities belong to the external agent or your surrounding workflow
 - `prepare.py` can either split one source dataset or consume an explicit test dataset.
 - The accepted artifact is retrained on all non-test training data.
 - `experiments/session_baseline.json` is the enforced freeze-point for the prepared data.
+- `experiments/search_memory.jsonl` is the local append-only search log.
+- `experiments/search_summary.json` is the current prepared-data-scoped summary derived from that log.
 
 ## Tests
 
