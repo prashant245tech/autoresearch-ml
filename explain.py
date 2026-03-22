@@ -208,13 +208,21 @@ def summarize_shap_values(
 
 
 def resolve_dataset(dataset: str, meta: dict) -> tuple[pd.DataFrame, str, str]:
+    paths = run_experiment.current_workspace_paths()
     train_df, test_df, _meta = run_experiment.load_prepared_data()
     target_column = resolve_target_column(meta)
     if dataset == "train":
-        return train_df, run_experiment.TRAIN_DATA_PATH, target_column
+        return train_df, paths.display_path(paths.train_data_path), target_column
     if dataset == "test":
-        return test_df, run_experiment.TEST_DATA_PATH, target_column
+        return test_df, paths.display_path(paths.test_data_path), target_column
     raise InvalidArtifactError(f"Unsupported dataset split: {dataset}")
+
+
+def resolve_artifact_dir(artifact_dir: str) -> str:
+    candidate = Path(artifact_dir)
+    if candidate.is_absolute():
+        return str(candidate)
+    return str((run_experiment.current_workspace_paths().workspace_root / candidate).resolve())
 
 
 def build_explanation_summary(
@@ -224,9 +232,11 @@ def build_explanation_summary(
     top_k: int,
     output_path: Optional[str] = None,
     allow_prepared_data_mismatch: bool = False,
+    workspace: Optional[str] = None,
 ) -> tuple[dict, int]:
+    run_experiment.configure_workspace(workspace)
     try:
-        bundle = load_artifact_bundle(artifact_dir)
+        bundle = load_artifact_bundle(resolve_artifact_dir(artifact_dir))
         manifest = bundle["manifest"]
         current_prepared_data_sha = run_experiment.current_prepared_data_sha_or_none()
         expected_prepared_data_sha = manifest.get("prepared_data_sha")
@@ -311,9 +321,17 @@ def build_explanation_summary(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Optional SHAP analysis for accepted artifacts")
     parser.add_argument(
+        "--workspace",
+        default=".",
+        help=(
+            "Workspace root containing the prepared data and accepted artifacts "
+            "(default: current directory)."
+        ),
+    )
+    parser.add_argument(
         "--artifact-dir",
         required=True,
-        help="Path to an accepted artifact directory under models/accepted/...",
+        help="Path to an accepted artifact directory under the workspace models/accepted/...",
     )
     parser.add_argument(
         "--dataset",
@@ -355,6 +373,7 @@ def main() -> int:
         top_k=args.top_k,
         output_path=args.output_path,
         allow_prepared_data_mismatch=args.allow_prepared_data_mismatch,
+        workspace=args.workspace,
     )
     print_json(summary)
     return exit_code

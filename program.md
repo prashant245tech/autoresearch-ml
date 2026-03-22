@@ -1,7 +1,19 @@
 # program.md - External agent workflow and generic ML tuning policy
 
-This file guides the external agent that edits the local generated `train.py`.
+This file guides the external agent that edits a workspace-local generated `train.py`.
 It is not consumed by `run_experiment.py`.
+
+Assume there is one active workspace per tuning session, for example:
+
+```bash
+WORKSPACE=workspaces/my_dataset
+```
+
+Use this file for tuning strategy and search policy.
+
+Use [AGENTS.md](/Users/prashant/Downloads/corrugated_automl%202/AGENTS.md) for
+repo contract, tracked vs local surfaces, framework commands, and implementation
+boundaries.
 
 ## External Agent Loop
 
@@ -9,41 +21,43 @@ It is not consumed by `run_experiment.py`.
 
 If the prepared parquet files do not exist yet, or if the dataset definition has changed:
 
-1. Update `config/task_context.md` if you need local dataset-specific notes for the current task.
-2. Create or update `config/feature_spec.json` directly from the local task context and user instructions.
-   - Keep `config/feature_spec.json` explicit and machine-readable because `prepare.py`
+1. Update `$WORKSPACE/config/task_context.md` if you need local dataset-specific notes for the current task.
+2. Create or update `$WORKSPACE/config/feature_spec.json` directly from the local task context and user instructions.
+   - Keep `$WORKSPACE/config/feature_spec.json` explicit and machine-readable because `prepare.py`
      executes it deterministically.
-   - Follow `config/feature_spec.schema.json` when writing the spec.
+   - Follow the tracked `config/feature_spec.schema.json` when writing the spec.
    - If the user wants to train on a subset of rows, encode that as
-     `train_row_filters` in `config/feature_spec.json`.
+     `train_row_filters` in `$WORKSPACE/config/feature_spec.json`.
    - If a filtered column should be cleaned or normalized but should not become
      a model feature, declare it in `filter_specs`.
    - If the user wants a separate evaluation dataset, set `test_data_file`
-     and optional `test_target_column` in `config/feature_spec.json`.
+     and optional `test_target_column` in `$WORKSPACE/config/feature_spec.json`.
    - If the user wants to scope the explicit test dataset too, encode that as
-     `test_row_filters` in `config/feature_spec.json`.
-3. Run `python prepare.py`.
-4. Delete `experiments/session_baseline.json` if it exists from a prior session.
+     `test_row_filters` in `$WORKSPACE/config/feature_spec.json`.
+3. Run `python prepare.py --workspace "$WORKSPACE"`.
+4. Delete `$WORKSPACE/experiments/session_baseline.json` if it exists from a prior session.
 5. Freeze the prepared data for the tuning session. The first
-   `python run_experiment.py run` or `accept` call will create a new
+   `python run_experiment.py run --workspace "$WORKSPACE"` or `accept` call will create a new
    session-baseline file that pins the prepared-data hashes.
 
 ### Tuning phase
 
 1. Read this file before proposing a change.
-2. If `train.py` does not exist yet, run `python run_experiment.py init-train`.
-3. Read `python run_experiment.py memory-summary` to understand prior runs for the current prepared data.
-4. Edit `train.py` only.
-5. Run `python run_experiment.py run`.
+2. If `$WORKSPACE/train.py` does not exist yet, run `python run_experiment.py init-train --workspace "$WORKSPACE"`.
+3. Read `python run_experiment.py memory-summary --workspace "$WORKSPACE"` to understand prior runs for the current prepared data.
+   - Pay particular attention to `consecutive_exploit_count`, `family_loss_streaks`,
+     `last_improvement_delta`, `plateau_signal`, and `overfit_signal`.
+4. Edit `$WORKSPACE/train.py` only.
+5. Run `python run_experiment.py run --workspace "$WORKSPACE"`.
 6. Compare the returned validation metrics against search memory for the current prepared data.
 7. Keep or discard the `train.py` change externally.
 8. If you reran `prepare.py` since the last accepted run, delete
-   `experiments/session_baseline.json` before continuing so the new tuning
+   `$WORKSPACE/experiments/session_baseline.json` before continuing so the new tuning
    session gets a clean prepared-data baseline.
 9. If you keep it, run:
 
 ```bash
-python run_experiment.py accept --expected-train-sha <train_sha>
+python run_experiment.py accept --workspace "$WORKSPACE" --expected-train-sha <train_sha>
 ```
 
 10. Commit or discard externally. The repo itself does not manage git, autonomous
@@ -51,22 +65,22 @@ python run_experiment.py accept --expected-train-sha <train_sha>
 
 ## Fixed Protocol
 
-- `prepare.py` defines the frozen `data/train.parquet` and `data/test.parquet` boundary.
-- `experiments/session_baseline.json` enforces that the prepared-data hashes stay fixed
+- `prepare.py` defines the frozen `$WORKSPACE/data/train.parquet` and `$WORKSPACE/data/test.parquet` boundary.
+- `$WORKSPACE/experiments/session_baseline.json` enforces that the prepared-data hashes stay fixed
   for the tuning session.
-- `experiments/search_memory.jsonl` records run/accept events automatically.
-- `experiments/search_summary.json` is the current prepared-data-scoped summary.
+- `$WORKSPACE/experiments/search_memory.jsonl` records run/accept events automatically.
+- `$WORKSPACE/experiments/search_summary.json` is the current prepared-data-scoped summary.
 - `run_experiment.py run` creates the deterministic internal validation split.
 - `run_experiment.py memory-summary` prints the current prepared-data-scoped search summary.
 - `explain.py` is an optional post-hoc interpretation tool for accepted artifacts; it is not part of the fast search loop.
 - Validation metrics are the search signal.
 - Test metrics are audit-only and are produced during `accept`.
 - The fixed experiment budget for `run` is 300 seconds.
-- The saved accepted artifact is retrained on all of `data/train.parquet`.
+- The saved accepted artifact is retrained on all of `$WORKSPACE/data/train.parquet`.
 
 ## Editable Surface
 
-Edit only the local generated `train.py`, specifically:
+Edit only the workspace-local generated `train.py`, specifically:
 - `EXPERIMENT_DESCRIPTION`
 - `engineer_features(df, meta)`
 - `build_model(meta)`
@@ -240,16 +254,16 @@ be clearly different in either:
 
 Keep this file generic. Store real dataset paths, cohort notes, domain hints,
 and task-specific feature descriptions in the local untracked file
-`config/task_context.md`.
+`$WORKSPACE/config/task_context.md`.
 
-Use `config/task_context.md` for:
+Use `$WORKSPACE/config/task_context.md` for:
 - dataset paths and target column names
 - active cohort filters or business-scope constraints
 - task-specific feature descriptions
 - domain notes the agent should consider during setup
 
 If you want a separate holdout dataset, add `test_data_file` and optional
-`test_target_column` to `config/feature_spec.json` directly.
+`test_target_column` to `$WORKSPACE/config/feature_spec.json` directly.
 
 Supported filter ops:
 - `eq`, `ne`

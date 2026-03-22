@@ -90,7 +90,7 @@ class ExplainTests(WorkspaceTestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(summary["status"], explain.STATUS_OK)
         self.assertEqual(summary["dataset"], "test")
-        self.assertEqual(summary["dataset_path"], run_experiment.TEST_DATA_PATH)
+        self.assertEqual(summary["dataset_path"], "data/test.parquet")
         self.assertEqual(summary["target_column"], DEFAULT_TARGET_COLUMN)
         self.assertEqual(summary["sample_size_used"], 5)
         self.assertEqual(summary["shap_backend"], "TreeExplainer")

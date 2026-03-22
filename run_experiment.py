@@ -37,15 +37,10 @@ import pandas as pd
 import search_memory
 from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
+from workspace_paths import WorkspacePaths
 
-TRAIN_PATH = "train.py"
-BASELINES_DIR = "baselines"
-DEFAULT_BASELINE_TRAIN_PATH = os.path.join(BASELINES_DIR, "train.generic.py")
-META_PATH = "data/columns.json"
-TRAIN_DATA_PATH = "data/train.parquet"
-TEST_DATA_PATH = "data/test.parquet"
-ACCEPTED_MODELS_DIR = "models/accepted"
-SESSION_BASELINE_PATH = "experiments/session_baseline.json"
+TRAIN_FILE_LABEL = "train.py"
+DEFAULT_BASELINE_TRAIN_PATH = str(WorkspacePaths.from_value(".").baseline_train_path)
 EXPERIMENT_BUDGET_S = 300
 VALIDATION_SPLIT_SIZE = 0.2
 VALIDATION_RANDOM_STATE = 42
@@ -57,6 +52,8 @@ STATUS_TRAIN_FAILED = "train_failed"
 STATUS_HASH_MISMATCH = "hash_mismatch"
 STATUS_PREPARED_DATA_MISMATCH = "prepared_data_mismatch"
 STATUS_INIT_FAILED = "init_failed"
+
+_ACTIVE_WORKSPACE_OVERRIDE: Optional[str] = None
 
 
 class HarnessValidationError(Exception):
@@ -95,8 +92,23 @@ def print_json(payload: dict) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
 
 
+def configure_workspace(workspace: Optional[str] = None) -> WorkspacePaths:
+    global _ACTIVE_WORKSPACE_OVERRIDE
+    _ACTIVE_WORKSPACE_OVERRIDE = workspace
+    return current_workspace_paths()
+
+
+def current_workspace_paths() -> WorkspacePaths:
+    return WorkspacePaths.from_value(_ACTIVE_WORKSPACE_OVERRIDE or ".")
+
+
+def workspace_path_display(path) -> str:
+    return current_workspace_paths().display_path(Path(path))
+
+
 def make_output_dir(train_sha: str) -> str:
-    return os.path.join(ACCEPTED_MODELS_DIR, train_sha[:12])
+    paths = current_workspace_paths()
+    return str(paths.accepted_models_dir / train_sha[:12])
 
 
 def current_timestamp() -> str:
@@ -129,22 +141,25 @@ def _baseline_payload(fingerprints: dict) -> dict:
 
 
 def load_prepared_data() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    for path in [TRAIN_DATA_PATH, TEST_DATA_PATH, META_PATH]:
+    paths = current_workspace_paths()
+    for path in [paths.train_data_path, paths.test_data_path, paths.meta_path]:
         if not os.path.exists(path):
             raise RuntimeError(f"{path} not found. Run prepare.py first.")
 
-    train_df = pd.read_parquet(TRAIN_DATA_PATH)
-    test_df = pd.read_parquet(TEST_DATA_PATH)
-    with open(META_PATH) as handle:
+    train_df = pd.read_parquet(paths.train_data_path)
+    test_df = pd.read_parquet(paths.test_data_path)
+    with open(paths.meta_path) as handle:
         meta = json.load(handle)
     return train_df, test_df, meta
 
 
 def resolve_target_column(meta: dict) -> str:
+    paths = current_workspace_paths()
     target_column = meta.get("target")
     if not isinstance(target_column, str) or not target_column.strip():
         raise InvalidCandidateError(
-            f"Prepared metadata in {META_PATH} must define a non-empty `target` field."
+            f"Prepared metadata in {paths.display_path(paths.meta_path)} "
+            "must define a non-empty `target` field."
         )
     return target_column
 
@@ -160,10 +175,11 @@ def split_features_and_target(df: pd.DataFrame, target_column: str) -> tuple[pd.
 
 
 def prepared_data_fingerprints() -> dict:
+    paths = current_workspace_paths()
     fingerprints = {
-        "train_data_sha": sha256_file(TRAIN_DATA_PATH),
-        "test_data_sha": sha256_file(TEST_DATA_PATH),
-        "meta_sha": sha256_file(META_PATH),
+        "train_data_sha": sha256_file(str(paths.train_data_path)),
+        "test_data_sha": sha256_file(str(paths.test_data_path)),
+        "meta_sha": sha256_file(str(paths.meta_path)),
     }
     fingerprints["prepared_data_sha"] = sha256_text(
         json.dumps(fingerprints, sort_keys=True)
@@ -172,15 +188,16 @@ def prepared_data_fingerprints() -> dict:
 
 
 def ensure_prepared_data_baseline() -> dict:
+    paths = current_workspace_paths()
     fingerprints = prepared_data_fingerprints()
-    os.makedirs("experiments", exist_ok=True)
+    os.makedirs(paths.experiments_dir, exist_ok=True)
 
-    if not os.path.exists(SESSION_BASELINE_PATH):
-        with open(SESSION_BASELINE_PATH, "w") as handle:
+    if not os.path.exists(paths.session_baseline_path):
+        with open(paths.session_baseline_path, "w") as handle:
             json.dump(_baseline_payload(fingerprints), handle, indent=2, sort_keys=True)
         return fingerprints
 
-    with open(SESSION_BASELINE_PATH) as handle:
+    with open(paths.session_baseline_path) as handle:
         baseline = json.load(handle)
 
     baseline_fingerprints = baseline.get("prepared_data", {})
@@ -193,7 +210,8 @@ def ensure_prepared_data_baseline() -> dict:
         mismatch_lines = ", ".join(mismatch_keys)
         raise PreparedDataMismatchError(
             "Prepared data changed since the session baseline "
-            f"({mismatch_lines}). Delete {SESSION_BASELINE_PATH} after rerunning prepare.py "
+            f"({mismatch_lines}). Delete {paths.display_path(paths.session_baseline_path)} "
+            "after rerunning prepare.py "
             "to start a new tuning session."
         )
 
@@ -201,7 +219,11 @@ def ensure_prepared_data_baseline() -> dict:
 
 
 def current_prepared_data_sha_or_none() -> Optional[str]:
-    if not all(os.path.exists(path) for path in [TRAIN_DATA_PATH, TEST_DATA_PATH, META_PATH]):
+    paths = current_workspace_paths()
+    if not all(
+        os.path.exists(path)
+        for path in [paths.train_data_path, paths.test_data_path, paths.meta_path]
+    ):
         return None
     return prepared_data_fingerprints().get("prepared_data_sha")
 
@@ -218,7 +240,7 @@ def split_train_for_validation(train_df: pd.DataFrame) -> tuple[pd.DataFrame, pd
 
 def extract_description_from_source(train_code: str) -> str:
     try:
-        tree = ast.parse(train_code, filename=TRAIN_PATH)
+        tree = ast.parse(train_code, filename=TRAIN_FILE_LABEL)
     except SyntaxError:
         return "experiment description unavailable"
 
@@ -282,26 +304,31 @@ def validate_train_module(module) -> None:
 
 def load_train_spec_from_source(train_source: str):
     try:
-        ast.parse(train_source, filename=TRAIN_PATH)
+        ast.parse(train_source, filename=TRAIN_FILE_LABEL)
     except SyntaxError as exc:
         raise InvalidCandidateError(f"train.py is not valid Python: {exc}") from exc
 
     module_name = f"train_runtime_{int(time.time() * 1_000_000)}"
     module = ModuleType(module_name)
-    module.__file__ = TRAIN_PATH
+    module.__file__ = TRAIN_FILE_LABEL
     module.__dict__["__name__"] = module_name
-    exec(compile(train_source, TRAIN_PATH, "exec"), module.__dict__)
+    exec(compile(train_source, TRAIN_FILE_LABEL, "exec"), module.__dict__)
     validate_train_module(module)
     return module
 
 
 def load_train_spec():
-    if not os.path.exists(TRAIN_PATH):
+    paths = current_workspace_paths()
+    if not os.path.exists(paths.train_py_path):
+        init_command = "python run_experiment.py init-train"
+        if paths.display_workspace_root() != ".":
+            init_command += f" --workspace {paths.display_workspace_root()}"
         raise InvalidCandidateError(
-            f"{TRAIN_PATH} not found. Run `python run_experiment.py init-train` "
-            f"to create it from {DEFAULT_BASELINE_TRAIN_PATH}."
+            f"{paths.display_path(paths.train_py_path)} not found. "
+            f"Run `{init_command}` "
+            f"to create it from {paths.display_path(paths.baseline_train_path)}."
         )
-    with open(TRAIN_PATH) as handle:
+    with open(paths.train_py_path) as handle:
         train_source = handle.read()
     train_sha = sha256_text(train_source)
     description = extract_description_from_source(train_source)
@@ -567,11 +594,19 @@ def fit_and_score_with_budget(
 
 
 def record_search_memory(event_type: str, payload: dict) -> Optional[dict]:
-    return search_memory.record_event(event_type, payload)
+    paths = current_workspace_paths()
+    return search_memory.record_event(
+        event_type,
+        payload,
+        events_path=str(paths.search_memory_path),
+        summary_path=str(paths.search_summary_path),
+    )
 
 
-def run_once() -> tuple[dict, int]:
+def run_once(workspace: Optional[str] = None) -> tuple[dict, int]:
+    configure_workspace(workspace)
     start_time = time.monotonic()
+    paths = current_workspace_paths()
 
     try:
         train_spec, train_source, train_sha, description = load_train_spec()
@@ -602,11 +637,12 @@ def run_once() -> tuple[dict, int]:
             "n_features": len(feature_names),
             "n_train_rows": int(len(X_train)),
             "n_val_rows": int(len(X_val)),
-            "session_baseline_path": SESSION_BASELINE_PATH,
+            "session_baseline_path": paths.display_path(paths.session_baseline_path),
             "status": worker_result["status"],
             "train_sha": train_sha,
             "validation_random_state": VALIDATION_RANDOM_STATE,
             "validation_split_size": VALIDATION_SPLIT_SIZE,
+            "workspace_root": paths.display_workspace_root(),
             **fingerprints,
             **feature_telemetry,
         }
@@ -645,23 +681,33 @@ def run_once() -> tuple[dict, int]:
             "budget_s": EXPERIMENT_BUDGET_S,
             "elapsed_s": round(float(time.monotonic() - start_time), 1),
             "experiment_description": extract_description_from_source(
-                Path(TRAIN_PATH).read_text() if os.path.exists(TRAIN_PATH) else ""
+                paths.train_py_path.read_text() if paths.train_py_path.exists() else ""
             ),
             "status": getattr(exc, "status", STATUS_TRAIN_FAILED),
             "error": str(exc),
+            "workspace_root": paths.display_workspace_root(),
         }
-        if os.path.exists(TRAIN_PATH):
-            failure["train_sha"] = sha256_file(TRAIN_PATH)
-        if all(os.path.exists(path) for path in [TRAIN_DATA_PATH, TEST_DATA_PATH, META_PATH]):
+        if paths.train_py_path.exists():
+            failure["train_sha"] = sha256_file(str(paths.train_py_path))
+        if all(
+            os.path.exists(path)
+            for path in [paths.train_data_path, paths.test_data_path, paths.meta_path]
+        ):
             failure.update(prepared_data_fingerprints())
-        failure["session_baseline_path"] = SESSION_BASELINE_PATH
+        failure["session_baseline_path"] = paths.display_path(paths.session_baseline_path)
         record_search_memory(search_memory.EVENT_TYPE_RUN, failure)
         return failure, 1
 
 
-def accept_once(expected_train_sha: str, output_dir: Optional[str] = None) -> tuple[dict, int]:
+def accept_once(
+    expected_train_sha: str,
+    output_dir: Optional[str] = None,
+    workspace: Optional[str] = None,
+) -> tuple[dict, int]:
+    configure_workspace(workspace)
     start_time = time.monotonic()
     output_path: Optional[Path] = None
+    paths = current_workspace_paths()
 
     try:
         train_spec, _train_source, train_sha, description = load_train_spec()
@@ -690,11 +736,14 @@ def accept_once(expected_train_sha: str, output_dir: Optional[str] = None) -> tu
         predict_test_elapsed_s = round(float(time.monotonic() - predict_test_started), 4)
         test_metrics = build_metrics(y_test, y_test_pred, "test")
 
-        resolved_output_dir = output_dir or make_output_dir(train_sha)
-        output_path = Path(resolved_output_dir)
+        resolved_output_dir = Path(output_dir) if output_dir else Path(make_output_dir(train_sha))
+        if not resolved_output_dir.is_absolute():
+            resolved_output_dir = paths.workspace_root / resolved_output_dir
+        output_path = resolved_output_dir.resolve()
         if output_path.exists():
             raise RuntimeError(
-                f"Artifact directory already exists: {resolved_output_dir}. Choose a new --output-dir."
+                f"Artifact directory already exists: {paths.display_path(output_path)}. "
+                "Choose a new --output-dir."
             )
 
         output_path.mkdir(parents=True, exist_ok=False)
@@ -707,7 +756,7 @@ def accept_once(expected_train_sha: str, output_dir: Optional[str] = None) -> tu
         joblib.dump(fitted_model, model_path)
         with open(features_path, "w") as handle:
             json.dump(feature_names, handle, indent=2)
-        shutil.copyfile(TRAIN_PATH, train_copy_path)
+        shutil.copyfile(paths.train_py_path, train_copy_path)
 
         manifest = {
             "artifact_paths": {
@@ -729,9 +778,10 @@ def accept_once(expected_train_sha: str, output_dir: Optional[str] = None) -> tu
             "output_dir": str(output_path),
             "predict_test_elapsed_s": predict_test_elapsed_s,
             "saved_at": current_timestamp(),
-            "session_baseline_path": SESSION_BASELINE_PATH,
+            "session_baseline_path": paths.display_path(paths.session_baseline_path),
             "status": STATUS_OK,
             "train_sha": train_sha,
+            "workspace_root": paths.display_workspace_root(),
             **fingerprints,
             **feature_telemetry,
             **test_metrics,
@@ -748,25 +798,33 @@ def accept_once(expected_train_sha: str, output_dir: Optional[str] = None) -> tu
         failure = {
             "elapsed_s": round(float(time.monotonic() - start_time), 1),
             "experiment_description": extract_description_from_source(
-                Path(TRAIN_PATH).read_text() if os.path.exists(TRAIN_PATH) else ""
+                paths.train_py_path.read_text() if paths.train_py_path.exists() else ""
             ),
             "status": getattr(exc, "status", STATUS_TRAIN_FAILED),
             "error": str(exc),
             "expected_train_sha": expected_train_sha,
+            "workspace_root": paths.display_workspace_root(),
         }
-        if os.path.exists(TRAIN_PATH):
-            failure["train_sha"] = sha256_file(TRAIN_PATH)
-        if all(os.path.exists(path) for path in [TRAIN_DATA_PATH, TEST_DATA_PATH, META_PATH]):
+        if paths.train_py_path.exists():
+            failure["train_sha"] = sha256_file(str(paths.train_py_path))
+        if all(
+            os.path.exists(path)
+            for path in [paths.train_data_path, paths.test_data_path, paths.meta_path]
+        ):
             failure.update(prepared_data_fingerprints())
-        failure["session_baseline_path"] = SESSION_BASELINE_PATH
+        failure["session_baseline_path"] = paths.display_path(paths.session_baseline_path)
         record_search_memory(search_memory.EVENT_TYPE_ACCEPT, failure)
         return failure, 1
 
 
-def memory_summary_once() -> tuple[dict, int]:
+def memory_summary_once(workspace: Optional[str] = None) -> tuple[dict, int]:
+    configure_workspace(workspace)
+    paths = current_workspace_paths()
     try:
         summary = search_memory.get_or_rebuild_summary(
-            prepared_data_sha=current_prepared_data_sha_or_none()
+            prepared_data_sha=current_prepared_data_sha_or_none(),
+            events_path=str(paths.search_memory_path),
+            summary_path=str(paths.search_summary_path),
         )
         return summary, 0
     except Exception as exc:
@@ -774,43 +832,61 @@ def memory_summary_once() -> tuple[dict, int]:
             {
                 "status": STATUS_TRAIN_FAILED,
                 "error": str(exc),
-                "search_memory_path": search_memory.SEARCH_MEMORY_PATH,
-                "search_summary_path": search_memory.SEARCH_SUMMARY_PATH,
+                "search_memory_path": paths.display_path(paths.search_memory_path),
+                "search_summary_path": paths.display_path(paths.search_summary_path),
                 "prepared_data_sha": current_prepared_data_sha_or_none(),
+                "workspace_root": paths.display_workspace_root(),
             },
             1,
         )
 
 
-def init_train_once(force: bool = False, baseline_path: Optional[str] = None) -> tuple[dict, int]:
-    source_path = baseline_path or DEFAULT_BASELINE_TRAIN_PATH
+def init_train_once(
+    force: bool = False,
+    baseline_path: Optional[str] = None,
+    workspace: Optional[str] = None,
+) -> tuple[dict, int]:
+    configure_workspace(workspace)
+    paths = current_workspace_paths()
+    source_path = Path(baseline_path) if baseline_path else paths.baseline_train_path
+    if not source_path.is_absolute():
+        source_path = (Path.cwd() / source_path).resolve()
 
     try:
         if not os.path.exists(source_path):
             raise RuntimeError(
                 f"Baseline train spec not found: {source_path}."
             )
-        if os.path.exists(TRAIN_PATH) and not force:
+        if paths.train_py_path.exists() and not force:
             raise RuntimeError(
-                f"{TRAIN_PATH} already exists. Re-run with `--force` to replace it."
+                f"{paths.display_path(paths.train_py_path)} already exists. "
+                "Re-run with `--force` to replace it."
             )
 
-        Path(TRAIN_PATH).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source_path, TRAIN_PATH)
-        with open(TRAIN_PATH, encoding="utf-8") as handle:
+        paths.train_py_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_path, paths.train_py_path)
+        with open(paths.train_py_path, encoding="utf-8") as handle:
             train_source = handle.read()
 
         return (
             {
                 "status": STATUS_OK,
-                "baseline_path": source_path,
+                "baseline_path": paths.display_path(source_path),
                 "experiment_description": extract_description_from_source(train_source),
                 "message": (
-                    f"Created local {TRAIN_PATH} from {source_path}. "
-                    "Edit train.py and then run `python run_experiment.py run`."
+                    f"Created local {paths.display_path(paths.train_py_path)} "
+                    f"from {paths.display_path(source_path)}. "
+                    "Edit train.py and then run "
+                    f"`python run_experiment.py run"
+                    + (
+                        f" --workspace {paths.display_workspace_root()}`."
+                        if paths.display_workspace_root() != "."
+                        else "`."
+                    )
                 ),
-                "train_path": TRAIN_PATH,
+                "train_path": paths.display_path(paths.train_py_path),
                 "train_sha": sha256_text(train_source),
+                "workspace_root": paths.display_workspace_root(),
             },
             0,
         )
@@ -818,9 +894,10 @@ def init_train_once(force: bool = False, baseline_path: Optional[str] = None) ->
         return (
             {
                 "status": STATUS_INIT_FAILED,
-                "baseline_path": source_path,
+                "baseline_path": paths.display_path(source_path),
                 "error": str(exc),
-                "train_path": TRAIN_PATH,
+                "train_path": paths.display_path(paths.train_py_path),
+                "workspace_root": paths.display_workspace_root(),
             },
             1,
         )
@@ -833,6 +910,17 @@ def run_single_from_train_entrypoint() -> None:
         sys.exit(exit_code)
 
 
+def add_workspace_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--workspace",
+        default=".",
+        help=(
+            "Workspace root containing local config/data/train.py state "
+            "(default: current directory)."
+        ),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Deterministic AutoResearch runner")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -841,27 +929,35 @@ def build_parser() -> argparse.ArgumentParser:
         "init-train",
         help="Create a local editable train.py from a tracked baseline",
     )
+    add_workspace_argument(init_parser)
     init_parser.add_argument(
         "--baseline-path",
         default=DEFAULT_BASELINE_TRAIN_PATH,
-        help=f"Source baseline to copy into {TRAIN_PATH}.",
+        help="Source baseline to copy into the workspace train.py.",
     )
     init_parser.add_argument(
         "--force",
         action="store_true",
-        help=f"Replace an existing {TRAIN_PATH}.",
+        help="Replace an existing workspace train.py.",
     )
 
-    subparsers.add_parser("run", help="Run validation-only evaluation for the current train.py")
-    subparsers.add_parser(
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Run validation-only evaluation for the current workspace train.py",
+    )
+    add_workspace_argument(run_parser)
+
+    summary_parser = subparsers.add_parser(
         "memory-summary",
         help="Print the current prepared-data-scoped search-memory summary",
     )
+    add_workspace_argument(summary_parser)
 
     accept_parser = subparsers.add_parser(
         "accept",
-        help="Retrain the accepted train.py on all train data and save artifact bundle",
+        help="Retrain the accepted workspace train.py on all train data and save artifact bundle",
     )
+    add_workspace_argument(accept_parser)
     accept_parser.add_argument(
         "--expected-train-sha",
         required=True,
@@ -880,13 +976,17 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.command == "init-train":
-        summary, exit_code = init_train_once(args.force, args.baseline_path)
+        summary, exit_code = init_train_once(args.force, args.baseline_path, args.workspace)
     elif args.command == "run":
-        summary, exit_code = run_once()
+        summary, exit_code = run_once(args.workspace)
     elif args.command == "memory-summary":
-        summary, exit_code = memory_summary_once()
+        summary, exit_code = memory_summary_once(args.workspace)
     else:
-        summary, exit_code = accept_once(args.expected_train_sha, args.output_dir)
+        summary, exit_code = accept_once(
+            args.expected_train_sha,
+            args.output_dir,
+            args.workspace,
+        )
 
     print_json(summary)
     return exit_code

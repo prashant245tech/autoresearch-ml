@@ -44,7 +44,7 @@ class WorkspaceTestCase(unittest.TestCase):
         df.to_parquet(path, index=False)
         return path
 
-    def create_prepared_data(self, train_df=None, test_df=None, meta=None):
+    def create_prepared_data(self, train_df=None, test_df=None, meta=None, prefix: str = ""):
         if train_df is None:
             x_train = np.arange(1, 41, dtype=float)
             train_df = pd.DataFrame(
@@ -72,7 +72,8 @@ class WorkspaceTestCase(unittest.TestCase):
                 "filter_spec_config": [],
             }
 
-        self.write_parquet("data/train.parquet", train_df)
-        self.write_parquet("data/test.parquet", test_df)
-        self.write_json("data/columns.json", meta)
+        base = f"{prefix.rstrip('/')}/" if prefix else ""
+        self.write_parquet(f"{base}data/train.parquet", train_df)
+        self.write_parquet(f"{base}data/test.parquet", test_df)
+        self.write_json(f"{base}data/columns.json", meta)
         return train_df, test_df, meta

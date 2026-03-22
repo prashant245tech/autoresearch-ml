@@ -16,3 +16,5 @@ models/best_features.pkl
 models/best_train.py
 models/accepted/
 experiments/session_baseline.json
+workspaces/*
+!workspaces/.gitkeep

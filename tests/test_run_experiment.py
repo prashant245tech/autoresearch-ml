@@ -66,24 +66,28 @@ def predict_model(model, X):
 
 class RunExperimentTests(WorkspaceTestCase):
     def write_baseline_train(self, content: str = VALID_TRAIN_SOURCE):
-        self.write_text(run_experiment.DEFAULT_BASELINE_TRAIN_PATH, content)
+        return self.write_text("custom-baselines/train.test.py", content)
 
     def test_init_train_once_creates_local_train_from_baseline(self):
-        self.write_baseline_train()
+        baseline_path = self.write_baseline_train()
 
-        summary, exit_code = run_experiment.init_train_once()
+        summary, exit_code = run_experiment.init_train_once(
+            baseline_path=str(baseline_path)
+        )
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(summary["status"], run_experiment.STATUS_OK)
-        self.assertEqual(summary["baseline_path"], run_experiment.DEFAULT_BASELINE_TRAIN_PATH)
+        self.assertEqual(summary["baseline_path"], "custom-baselines/train.test.py")
         self.assertTrue(self.abs_path("train.py").exists())
         self.assertEqual(self.abs_path("train.py").read_text(), VALID_TRAIN_SOURCE)
 
     def test_init_train_once_requires_force_to_replace_existing_train(self):
-        self.write_baseline_train(VALID_TRAIN_SOURCE)
+        baseline_path = self.write_baseline_train(VALID_TRAIN_SOURCE)
         self.write_text("train.py", TREE_TRAIN_SOURCE)
 
-        summary, exit_code = run_experiment.init_train_once()
+        summary, exit_code = run_experiment.init_train_once(
+            baseline_path=str(baseline_path)
+        )
 
         self.assertEqual(exit_code, 1)
         self.assertEqual(summary["status"], run_experiment.STATUS_INIT_FAILED)
@@ -129,6 +133,7 @@ class RunExperimentTests(WorkspaceTestCase):
             "val_mape": 2.0,
             "val_rmse": 3.0,
             "val_r2": 0.5,
+            "train_val_mape_ratio": 2.0,
         }
 
         summary = search_memory.build_summary([legacy_event], "prep-1")
@@ -141,10 +146,133 @@ class RunExperimentTests(WorkspaceTestCase):
         self.assertEqual(summary["best_run"]["change_type"], "family_probe")
         self.assertEqual(summary["best_run"]["declared_family"], "LinearRegression")
         self.assertEqual(summary["family_branch_depth"]["latest_move_intent"], "explore_new_branch")
+        self.assertEqual(summary["consecutive_exploit_count"], 0)
+        self.assertEqual(summary["family_loss_streaks"], {"LinearRegression": 0})
+        self.assertEqual(summary["last_improvement_delta"], None)
+        self.assertEqual(
+            summary["plateau_signal"],
+            {"delta": None, "is_plateau": False, "threshold": search_memory.PLATEAU_DELTA_THRESHOLD},
+        )
+        self.assertEqual(
+            summary["overfit_signal"],
+            {
+                "is_overfit": True,
+                "model_class": "LinearRegression",
+                "threshold": search_memory.OVERFIT_RATIO_THRESHOLD,
+                "train_sha": "train-1",
+                "train_val_mape_ratio": 2.0,
+            },
+        )
         self.assertEqual(
             summary["recent_events"][0]["move_intent"],
             "explore_new_branch",
         )
+
+    def test_build_summary_exposes_controller_signals(self):
+        events = [
+            {
+                "event_id": "evt-1",
+                "event_type": search_memory.EVENT_TYPE_RUN,
+                "recorded_at": "2026-03-22T09:00:00",
+                "prepared_data_sha": "prep-1",
+                "train_sha": "train-1",
+                "experiment_description": (
+                    "move_intent=explore_new_branch | change_type=family_probe | "
+                    "family=ExtraTrees | change=baseline"
+                ),
+                "status": run_experiment.STATUS_OK,
+                "model_class": "ExtraTreesRegressor",
+                "model_params": {"max_depth": 20},
+                "candidate_signature": "cand-1",
+                "model_signature": "model-1",
+                "feature_signature": "feat-1",
+                "feature_names": ["feature_a"],
+                "n_features": 1,
+                "n_base_features": 1,
+                "n_derived_features": 0,
+                "train_mape": 2.0,
+                "val_mape": 6.0,
+                "val_rmse": 3.0,
+                "val_r2": 0.5,
+                "train_val_mape_ratio": 1.2,
+            },
+            {
+                "event_id": "evt-2",
+                "event_type": search_memory.EVENT_TYPE_RUN,
+                "recorded_at": "2026-03-22T09:05:00",
+                "prepared_data_sha": "prep-1",
+                "train_sha": "train-2",
+                "experiment_description": (
+                    "move_intent=exploit_current_winner | change_type=param_refine | "
+                    "family=ExtraTrees | change=max_features 0.7->0.6"
+                ),
+                "status": run_experiment.STATUS_OK,
+                "model_class": "ExtraTreesRegressor",
+                "model_params": {"max_depth": 20, "max_features": 0.6},
+                "candidate_signature": "cand-2",
+                "model_signature": "model-2",
+                "feature_signature": "feat-2",
+                "feature_names": ["feature_a", "feature_b"],
+                "n_features": 2,
+                "n_base_features": 1,
+                "n_derived_features": 1,
+                "train_mape": 1.8,
+                "val_mape": 6.05,
+                "val_rmse": 3.1,
+                "val_r2": 0.49,
+                "train_val_mape_ratio": 1.6,
+            },
+            {
+                "event_id": "evt-3",
+                "event_type": search_memory.EVENT_TYPE_RUN,
+                "recorded_at": "2026-03-22T09:10:00",
+                "prepared_data_sha": "prep-1",
+                "train_sha": "train-3",
+                "experiment_description": (
+                    "move_intent=exploit_current_winner | change_type=feature_cleanup | "
+                    "family=ExtraTrees | change=drop noisy interaction"
+                ),
+                "status": run_experiment.STATUS_OK,
+                "model_class": "ExtraTreesRegressor",
+                "model_params": {"max_depth": 20, "max_features": 0.6},
+                "candidate_signature": "cand-3",
+                "model_signature": "model-3",
+                "feature_signature": "feat-3",
+                "feature_names": ["feature_a"],
+                "n_features": 1,
+                "n_base_features": 1,
+                "n_derived_features": 0,
+                "train_mape": 1.6,
+                "val_mape": 6.05,
+                "val_rmse": 3.05,
+                "val_r2": 0.5,
+                "train_val_mape_ratio": 1.7,
+            },
+        ]
+
+        summary = search_memory.build_summary(events, "prep-1")
+
+        self.assertEqual(summary["family_branch_depth"]["depth"], 3)
+        self.assertEqual(summary["family_branch_depth"]["consecutive_exploit_count"], 2)
+        self.assertEqual(summary["consecutive_exploit_count"], 2)
+        self.assertEqual(summary["family_loss_streaks"], {"ExtraTreesRegressor": 2})
+        self.assertEqual(summary["last_improvement_delta"], 0.05)
+        self.assertEqual(
+            summary["plateau_signal"],
+            {"delta": 0.05, "is_plateau": True, "threshold": search_memory.PLATEAU_DELTA_THRESHOLD},
+        )
+        self.assertEqual(
+            summary["overfit_signal"],
+            {
+                "is_overfit": True,
+                "model_class": "ExtraTreesRegressor",
+                "threshold": search_memory.OVERFIT_RATIO_THRESHOLD,
+                "train_sha": "train-3",
+                "train_val_mape_ratio": 1.7,
+            },
+        )
+        self.assertEqual(summary["best_run"]["train_val_mape_ratio"], 1.2)
+        self.assertEqual(summary["best_run"]["overfit_signal"], False)
 
     def load_search_events(self):
         path = self.abs_path(search_memory.SEARCH_MEMORY_PATH)
@@ -346,6 +474,14 @@ class RunExperimentTests(WorkspaceTestCase):
         self.assertEqual(summary["recent_events"], [])
         self.assertEqual(summary["move_intent_distribution"], {})
         self.assertIsNone(summary["family_branch_depth"])
+        self.assertEqual(summary["consecutive_exploit_count"], 0)
+        self.assertEqual(summary["family_loss_streaks"], {})
+        self.assertIsNone(summary["overfit_signal"])
+        self.assertIsNone(summary["last_improvement_delta"])
+        self.assertEqual(
+            summary["plateau_signal"],
+            {"delta": None, "is_plateau": False, "threshold": search_memory.PLATEAU_DELTA_THRESHOLD},
+        )
         self.assertTrue(self.abs_path(search_memory.SEARCH_SUMMARY_PATH).exists())
         self.assertFalse(self.abs_path(search_memory.SEARCH_MEMORY_PATH).exists())
 
@@ -404,3 +540,17 @@ class RunExperimentTests(WorkspaceTestCase):
         self.assertEqual(summary["prepared_data_sha"], second_scope)
         self.assertEqual(summary["counts"]["total_runs"], 1)
         self.assertEqual(summary["best_run"]["train_sha"], second_summary["train_sha"])
+
+    def test_workspace_specific_run_uses_isolated_paths(self):
+        workspace = "workspaces/demo"
+        self.create_prepared_data(prefix=workspace)
+        self.write_text(f"{workspace}/train.py", VALID_TRAIN_SOURCE)
+
+        summary, exit_code = run_experiment.run_once(workspace=workspace)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(summary["status"], run_experiment.STATUS_OK)
+        self.assertEqual(summary["workspace_root"], workspace)
+        self.assertTrue(self.abs_path(f"{workspace}/experiments/session_baseline.json").exists())
+        self.assertTrue(self.abs_path(f"{workspace}/experiments/search_memory.jsonl").exists())
+        self.assertFalse(self.abs_path("experiments/session_baseline.json").exists())

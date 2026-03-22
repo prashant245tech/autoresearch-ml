@@ -9,6 +9,9 @@ Run order:
     python train.py      ← agent iterates on this
 """
 
+from __future__ import annotations
+
+import argparse
 import json
 import os
 import sys
@@ -17,14 +20,11 @@ import warnings
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
+from workspace_paths import WorkspacePaths
 
 warnings.filterwarnings("ignore")
 
-SPEC_PATH = "config/feature_spec.json"
-SPEC_SCHEMA_PATH = "config/feature_spec.schema.json"
-TRAIN_PATH = "data/train.parquet"
-TEST_PATH = "data/test.parquet"
-META_PATH = "data/columns.json"
+DEFAULT_SPEC_LABEL = "config/feature_spec.json"
 
 ALLOWED_FEATURE_TYPES = {"numeric", "ordinal", "categorical", "boolean"}
 ALLOWED_FILL_STRATEGIES = {"value", "median", "mean", "mode", "none"}
@@ -146,13 +146,18 @@ def _validate_column_spec(item: dict, label: str, allowed_keys: set[str]) -> dic
     return item
 
 
-def validate_column_specs(specs, label: str, require_non_empty: bool = False) -> list:
+def validate_column_specs(
+    specs,
+    label: str,
+    require_non_empty: bool = False,
+    spec_label: str = DEFAULT_SPEC_LABEL,
+) -> list:
     if specs is None:
         specs = []
     if not isinstance(specs, list):
         _fail(f"{label} must be a list.")
     if require_non_empty and not specs:
-        _fail(f"{SPEC_PATH} `{label}` must be a non-empty list.")
+        _fail(f"{spec_label} `{label}` must be a non-empty list.")
 
     validated = []
     seen_columns = set()
@@ -204,33 +209,33 @@ def validate_row_filters(filters, label: str) -> list:
     return validated
 
 
-def validate_spec(spec: dict) -> dict:
+def validate_spec(spec: dict, spec_label: str = DEFAULT_SPEC_LABEL) -> dict:
     if not isinstance(spec, dict):
-        _fail(f"{SPEC_PATH} must contain a top-level JSON object.")
-    _reject_unknown_keys(spec, ALLOWED_TOP_LEVEL_KEYS, SPEC_PATH)
+        _fail(f"{spec_label} must contain a top-level JSON object.")
+    _reject_unknown_keys(spec, ALLOWED_TOP_LEVEL_KEYS, spec_label)
 
     required_top_level = ["data_file", "target_column", "features"]
     missing = [key for key in required_top_level if key not in spec]
     if missing:
-        _fail(f"{SPEC_PATH} is missing required keys: " + ", ".join(missing))
+        _fail(f"{spec_label} is missing required keys: " + ", ".join(missing))
 
     if not isinstance(spec["data_file"], str) or not spec["data_file"].strip():
-        _fail(f"{SPEC_PATH} `data_file` must be a non-empty string.")
+        _fail(f"{spec_label} `data_file` must be a non-empty string.")
     if not isinstance(spec["target_column"], str) or not spec["target_column"].strip():
-        _fail(f"{SPEC_PATH} `target_column` must be a non-empty string.")
+        _fail(f"{spec_label} `target_column` must be a non-empty string.")
 
     if "test_data_file" in spec and (
         not isinstance(spec["test_data_file"], str) or not spec["test_data_file"].strip()
     ):
-        _fail(f"{SPEC_PATH} `test_data_file` must be a non-empty string when set.")
+        _fail(f"{spec_label} `test_data_file` must be a non-empty string when set.")
     if "test_target_column" in spec and (
         not isinstance(spec["test_target_column"], str)
         or not spec["test_target_column"].strip()
     ):
-        _fail(f"{SPEC_PATH} `test_target_column` must be a non-empty string when set.")
+        _fail(f"{spec_label} `test_target_column` must be a non-empty string when set.")
 
     if "row_filters" in spec and "train_row_filters" in spec:
-        _fail(f"Use either `row_filters` or `train_row_filters` in {SPEC_PATH}, not both.")
+        _fail(f"Use either `row_filters` or `train_row_filters` in {spec_label}, not both.")
 
     spec["train_row_filters"] = validate_row_filters(
         spec.get("train_row_filters", spec.get("row_filters")),
@@ -240,13 +245,22 @@ def validate_spec(spec: dict) -> dict:
         spec.get("test_row_filters"),
         "test_row_filters",
     )
-    spec["features"] = validate_column_specs(spec["features"], "features", require_non_empty=True)
-    spec["filter_specs"] = validate_column_specs(spec.get("filter_specs", []), "filter_specs")
+    spec["features"] = validate_column_specs(
+        spec["features"],
+        "features",
+        require_non_empty=True,
+        spec_label=spec_label,
+    )
+    spec["filter_specs"] = validate_column_specs(
+        spec.get("filter_specs", []),
+        "filter_specs",
+        spec_label=spec_label,
+    )
 
     if spec.get("test_target_column") and not spec.get("test_data_file"):
-        _fail(f"{SPEC_PATH} `test_target_column` requires `test_data_file`.")
+        _fail(f"{spec_label} `test_target_column` requires `test_data_file`.")
     if spec["test_row_filters"] and not spec.get("test_data_file"):
-        _fail(f"{SPEC_PATH} `test_row_filters` requires `test_data_file`.")
+        _fail(f"{spec_label} `test_row_filters` requires `test_data_file`.")
 
     feature_columns = {feat["column"] for feat in spec["features"]}
     filter_spec_columns = {feat["column"] for feat in spec["filter_specs"]}
@@ -270,21 +284,32 @@ def validate_spec(spec: dict) -> dict:
     return spec
 
 
-def load_spec() -> dict:
-    if not os.path.exists(SPEC_PATH):
+def load_spec(paths: WorkspacePaths) -> dict:
+    spec_path = paths.feature_spec_path
+    schema_path = paths.feature_spec_schema_path
+    spec_label = paths.display_path(spec_path)
+    if not os.path.exists(spec_path):
         _fail(
-            f"{SPEC_PATH} not found.\n"
-            f"          Create it directly from program.md and validate against {SPEC_SCHEMA_PATH}"
+            f"{spec_label} not found.\n"
+            "          Create it directly from program.md and validate against "
+            f"{paths.display_path(schema_path)}"
         )
-    with open(SPEC_PATH) as handle:
+    with open(spec_path) as handle:
         spec = json.load(handle)
-    return validate_spec(spec)
+    return validate_spec(spec, spec_label=spec_label)
 
 
-def load_table(file_path: str) -> pd.DataFrame:
+def load_table(
+    file_path: str,
+    spec_label: str = DEFAULT_SPEC_LABEL,
+    paths: WorkspacePaths | None = None,
+) -> pd.DataFrame:
+    workspace_paths = paths or WorkspacePaths.from_value(".")
+    workspace_data_dir = workspace_paths.data_dir
     candidates = [
         file_path,
         f"/mnt/user-data/uploads/{os.path.basename(file_path)}",
+        str(workspace_data_dir / os.path.basename(file_path)),
         f"data/{os.path.basename(file_path)}",
     ]
     for path in candidates:
@@ -298,7 +323,7 @@ def load_table(file_path: str) -> pd.DataFrame:
             return df
     _fail(
         f"File not found at '{file_path}'.\n"
-        f"          Update program.md / {SPEC_PATH} and regenerate the prep spec."
+        f"          Update program.md / {spec_label} and regenerate the prep spec."
     )
 
 
@@ -595,10 +620,26 @@ def prepare_dataset(
     return df
 
 
-def main():
-    os.makedirs("data", exist_ok=True)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Deterministic data preparation pipeline")
+    parser.add_argument(
+        "--workspace",
+        default=".",
+        help=(
+            "Workspace root containing local config/data directories "
+            "(default: current directory)."
+        ),
+    )
+    return parser
 
-    spec = load_spec()
+
+def main():
+    args = build_parser().parse_args()
+    paths = WorkspacePaths.from_value(args.workspace)
+    os.makedirs(paths.data_dir, exist_ok=True)
+
+    spec = load_spec(paths)
+    spec_label = paths.display_path(paths.feature_spec_path)
     features = spec["features"]
     filter_specs = spec.get("filter_specs", [])
     target = spec["target_column"]
@@ -607,6 +648,7 @@ def main():
     train_filters = spec.get("train_row_filters", [])
     test_filters = spec.get("test_row_filters", [])
 
+    print(f"[prepare] Workspace     : {paths.display_workspace_root()}")
     print(f"[prepare] Spec version  : {spec.get('version', '?')}")
     print(f"[prepare] Train source  : {spec['data_file']}")
     print(f"[prepare] Target        : {target}")
@@ -620,7 +662,7 @@ def main():
     if test_filters:
         print(f"[prepare] Test filters  : {test_filters}")
 
-    train_raw = load_table(spec["data_file"])
+    train_raw = load_table(spec["data_file"], spec_label=spec_label, paths=paths)
     train_prepared = prepare_dataset(
         train_raw,
         features,
@@ -638,7 +680,7 @@ def main():
     train_final, model_cols, ref_cols = build_matrix(train_encoded, features, encoding_meta, target)
 
     if test_data_file:
-        test_raw = load_table(test_data_file)
+        test_raw = load_table(test_data_file, spec_label=spec_label, paths=paths)
         test_prepared = prepare_dataset(
             test_raw,
             features,
@@ -674,10 +716,16 @@ def main():
     print(f"\n[prepare] Price/MSF stats (train prepared source):")
     print(train_final[target].describe().to_string())
 
-    train_df.to_parquet(TRAIN_PATH, index=False)
-    test_df.to_parquet(TEST_PATH, index=False)
-    print(f"\n[prepare] Saved → {TRAIN_PATH} ({len(train_df):,} rows)")
-    print(f"[prepare] Saved → {TEST_PATH}   ({len(test_df):,} rows)")
+    train_df.to_parquet(paths.train_data_path, index=False)
+    test_df.to_parquet(paths.test_data_path, index=False)
+    print(
+        f"\n[prepare] Saved → {paths.display_path(paths.train_data_path)} "
+        f"({len(train_df):,} rows)"
+    )
+    print(
+        f"[prepare] Saved → {paths.display_path(paths.test_data_path)}   "
+        f"({len(test_df):,} rows)"
+    )
 
     meta = {
         "target": target,
@@ -702,10 +750,14 @@ def main():
             for key, value in train_final[target].describe().items()
         },
     }
-    with open(META_PATH, "w") as handle:
+    meta["workspace_root"] = paths.display_workspace_root()
+    with open(paths.meta_path, "w") as handle:
         json.dump(meta, handle, indent=2)
-    print(f"[prepare] Saved → {META_PATH}")
-    print("\n[prepare] ✅ Done. Run: python train.py")
+    print(f"[prepare] Saved → {paths.display_path(paths.meta_path)}")
+    print(
+        "\n[prepare] ✅ Done. Run: "
+        f"python run_experiment.py init-train --workspace {paths.display_workspace_root()}"
+    )
 
 
 if __name__ == "__main__":
